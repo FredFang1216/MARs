@@ -22,6 +22,38 @@ It is not a paper generator. It is a complete scientific research engine — fro
 
 ---
 
+## Two Interfaces
+
+Claude Paper provides both a **CLI** for power users and a **Web UI** for visual, real-time research management.
+
+### CLI
+
+Interactive terminal with full command set, keyboard navigation, and real-time progress display. Best for hands-on research sessions where you want direct control.
+
+```bash
+bun run dev          # launch CLI
+```
+
+### Web UI
+
+Real-time research dashboard with WebSocket streaming, interactive claim graph visualization, experiment monitoring, and literature management — all in the browser.
+
+```bash
+bun run src/entrypoints/web.ts   # backend on :3456
+cd web && npx vite               # frontend on :5173
+```
+
+**Web UI features:**
+
+- **Live orchestrator control** — start/stop the Builder→Skeptic→Arbiter cycle, approve or skip decisions in real-time, live progress log streaming
+- **Interactive claim graph** — visual DAG with epistemic layer layout, phase-based coloring, edge type styling, zoom/pan/filter, claim detail drawer
+- **Experiment dashboard** — group by purpose/claim/chronological, per-experiment detail with metrics tables, figure gallery, audit status, narrative sections (Builder/Skeptic/Arbiter), research journal viewer
+- **Literature panel** — fullscreen review mode, PDF reading with annotation, paper search, gap tracking
+- **Budget & stability monitoring** — real-time convergence score, evidence coverage, budget burn rate
+- **Multi-session management** — switch between research projects, conversation + research modes
+
+---
+
 ## Core Ideas
 
 ### Claim Graph, Not Belief Lists
@@ -59,16 +91,16 @@ In **exploratory mode** (`--exploratory`), the adversarial pressure is relaxed: 
 
 A hardcoded gate controls what enters the paper. Claims must pass through `proposed -> under_investigation -> admitted`. This isn't prompt-level advice ("please don't write unsupported claims") — it's **code-level enforcement**:
 
-- No evidence at all -> cannot admit
+- No evidence at all → cannot admit
 - Theorem claims need both literature support (grounded) AND your own proof (derived)
-- Evidence typed as "consistent with" but not "supports" -> cannot admit
-- Dependencies not yet admitted -> you can't be admitted either
+- Evidence typed as "consistent with" but not "supports" → cannot admit
+- Dependencies not yet admitted → you can't be admitted either
 
-Claims that fail the gate don't disappear. They're routed to discussion/limitations. This is **boundary contraction** — when evidence is insufficient, actively narrow the claim scope instead of forcing the story. An honest claim of "MS-GARCH is optimal on point estimates but not statistically significant" is far more valuable than the false claim "MS-GARCH significantly outperforms all baselines."
+Claims that fail the gate don't disappear. They're routed to discussion/limitations. This is **boundary contraction** — when evidence is insufficient, actively narrow the claim scope instead of forcing the story.
 
 ### Two Kinds of Evidence
 
-Inspired by the UniScientist paper, all evidence is classified as:
+All evidence is classified as:
 
 - **Grounded Evidence** — independently verifiable facts from external sources: theorems from papers, statistical properties from datasets, known benchmark results.
 - **Formally-Derived Evidence** — conclusions from your own work: theorems you proved, experiments you ran, statistical tests you performed.
@@ -77,85 +109,122 @@ A robust core claim should have **both types**. The system continuously tracks e
 
 ---
 
-## Features
-
-- **Deep literature research** — four-phase pipeline (plan → discover → acquire → index) across arXiv, Semantic Scholar, SSRN, with PDF extraction and vision-based figure understanding
-- **Proposal generation** — interactive terminal browser with keyboard navigation, editing, regeneration, and novelty checking
-- **Adaptive orchestrator** — not a pipeline; the Builder→Skeptic→Arbiter cycle dynamically decides what to do next based on the ClaimGraph
-- **Experiment system** — tiered execution (Tier 0 quick checks, Tier 1 probes, Tier 2 publication-grade), isolated environments (uv/Docker/venv), static + semantic code audit, auto-generated NOTE.md per experiment and aggregated JOURNAL.md
-- **Writing pipeline** — narrative planning (hook → gap → insight → method → evidence → nuance), section writing from fragments, venue-aware page budgets, hero figure design, multi-round LaTeX compilation with auto-fix
-- **Math reasoning** — multi-round interaction with reasoning models, proof budget control (sketch → semi-formal → formal) based on theorem importance and venue expectations
-- **Peer review** — rubric-driven with 15-25 atomic checklist items, 7-dimension scoring, multi-reviewer parallel execution, grounded in latest literature, failed items auto-dispatched as repair tasks
-- **Domain knowledge packs** — structured extraction from textbooks and papers (theorems, definitions, algorithms), connection graphs, searchable indices, loaded into agent context for domain-aware reasoning
-- **Exploratory mode** — `--exploratory` flag for preliminary research with relaxed admission thresholds and broader exploration
-- **LaTeX compilation** — rule-based error diagnosis with LLM fallback, up to 15 retry rounds, venue template support (NeurIPS, ICML, AAAI, ACL, JFE, RFS)
-- **Paper delivery** — packaging for arxiv (flat tar.gz), camera-ready (de-anonymized, copyright), or standard format, with auto-generated reproduction scripts and git tagging
-- **Zotero import** — import existing paper libraries from local Zotero data directories
-- **ClaimGraph viewer** — fullscreen terminal UI with 5 modes (claims, detail, bridges, admission, contraction) and keyboard navigation
-
----
-
 ## Architecture
 
 ```
-src/paper/
-├── orchestrator.ts              # Three-role (Builder→Skeptic→Arbiter) cycle
-├── claim-graph/                 # Typed DAG of claims with epistemic layers
-│   ├── index.ts                 # ClaimGraph CRUD, query, cascade analysis
-│   ├── types.ts                 # Claim, ClaimEdge, EpistemicLayer types
-│   ├── context-views.ts         # L0/L1/L2 compression for context management
-│   ├── focus-selector.ts        # Role-specific subgraph selection
-│   └── prompt-assembler.ts      # Role-specific prompt construction
-├── admission-gate.ts            # 6 deterministic admission rules
-├── evidence-pool.ts             # Grounded + derived evidence tracking
-├── convergence.ts               # 4-component convergence detection
-├── research-state.ts            # Full cognitive state (serializable)
-├── deep-research/               # 4-phase literature research engine
-├── writing/                     # Narrative planner, section writer, page checker
-│   ├── pipeline.ts              # 8-phase writing orchestration
-│   ├── narrative-planner.ts     # Story arc from ClaimGraph
-│   ├── figure-designer.ts       # Hero figure + main table design
-│   └── page-checker.ts          # Venue page limit enforcement
-├── experiment/                  # Tiered experiment runner with isolation
-├── domain-knowledge/            # Knowledge pack builder, loader, indices
-│   ├── pack-builder.ts          # Build packs from textbooks/papers
-│   ├── planner.ts               # Plan pack structure from sources
-│   ├── entry-store.ts           # Knowledge entry CRUD
-│   └── loader.ts                # Load packs into research context
-├── review/                      # Rubric-driven multi-reviewer system
-├── delivery/                    # Paper packaging (arxiv/camera-ready/standard)
-├── llm-client.ts                # Multi-model routing (Claude + GPT)
-├── math-reasoning-controller.ts # Multi-round proof interaction
-├── fragment-store.ts            # LaTeX fragment management
-└── pdf-processor.ts             # PDF text + image extraction + vision
+src/
+├── entrypoints/
+│   ├── cli.tsx                     # Terminal UI (Ink + Commander)
+│   └── web.ts                      # Web server (Bun HTTP + WebSocket)
+│
+├── paper/                          # ── Core Research Engine ──
+│   ├── orchestrator.ts             # Builder→Skeptic→Arbiter cycle
+│   ├── agent-dispatch.ts           # Agent loading + multi-provider model routing
+│   ├── llm-client.ts               # Claude, GPT, DeepSeek, Qwen, GLM clients
+│   │
+│   ├── claim-graph/                # Epistemic claim DAG
+│   │   ├── index.ts                # CRUD, query, cascade analysis, bridge detection
+│   │   ├── types.ts                # Claim, ClaimEdge, EpistemicLayer types
+│   │   ├── context-views.ts        # L0/L1/L2 compression for context management
+│   │   ├── focus-selector.ts       # Role-specific subgraph selection
+│   │   └── prompt-assembler.ts     # Role-specific prompt construction
+│   │
+│   ├── admission-gate.ts           # 6 deterministic admission rules
+│   ├── evidence-pool.ts            # Grounded + derived evidence tracking
+│   ├── convergence.ts              # 4-component convergence detection
+│   ├── research-state.ts           # Full cognitive state (serializable)
+│   │
+│   ├── deep-research/              # 4-phase literature research
+│   │   ├── planner.ts              # Multi-dimensional research plan
+│   │   ├── discovery.ts            # arXiv, Semantic Scholar, SSRN search
+│   │   ├── citation-graph.ts       # Citation network analysis
+│   │   └── analyzer.ts             # Batch paper analysis
+│   │
+│   ├── experiments/                # Experiment lifecycle management
+│   │   ├── create-experiment.ts    # Design from Arbiter decisions
+│   │   ├── notebook.ts             # Per-experiment NOTE.md generation
+│   │   ├── journal.ts              # Aggregated JOURNAL.md
+│   │   ├── auditor.ts              # Static + semantic code audit
+│   │   ├── results-reader.ts       # Parse metrics, tables, figures
+│   │   └── promoter.ts             # Promote probes to publication-grade
+│   │
+│   ├── experiment/                 # Execution infrastructure
+│   │   ├── runner.ts               # Isolated execution (uv/venv/docker)
+│   │   ├── environment.ts          # Python environment management
+│   │   ├── data-acquisition.ts     # Dataset download + validation
+│   │   └── resource-estimator.ts   # GPU/memory/runtime estimation
+│   │
+│   ├── writing/                    # 8-phase paper writing pipeline
+│   │   ├── pipeline.ts             # Orchestration of all writing phases
+│   │   ├── narrative-planner.ts    # Story arc from ClaimGraph
+│   │   ├── figure-designer.ts      # Hero figure + main table design
+│   │   ├── writer.ts               # Section content generation
+│   │   ├── bibtex-manager.ts       # Bibliography management
+│   │   ├── latex-engine.ts         # Compilation + error diagnosis
+│   │   └── page-checker.ts         # Venue page limit enforcement
+│   │
+│   ├── domain-knowledge/           # Knowledge pack system
+│   │   ├── pack-builder.ts         # Extract from textbooks/papers
+│   │   ├── loader.ts               # Load packs into agent context
+│   │   ├── entry-store.ts          # Theorem/definition/algorithm CRUD
+│   │   └── registry-builder.ts     # Dataset/benchmark/codebase registries
+│   │
+│   ├── review/                     # Peer review system
+│   │   ├── reviewer.ts             # Multi-reviewer parallel execution
+│   │   ├── meta-reviewer.ts        # Aggregate + accept/reject
+│   │   └── revision-handler.ts     # Failed items → repair tasks
+│   │
+│   ├── delivery/                   # Paper packaging (arxiv/camera-ready)
+│   ├── math-reasoning-controller.ts  # Multi-round proof interaction
+│   ├── auto-mode.ts                # Full autonomous orchestration
+│   └── session.ts                  # Multi-session management
+│
+├── web/                            # ── Web Backend ──
+│   ├── api/routes.ts               # REST API (sessions, state, experiments, literature)
+│   ├── agent/webAgent.ts           # WebSocket JSON-RPC handler
+│   ├── orchestrator/manager.ts     # Live orchestrator lifecycle
+│   ├── chat/manager.ts             # Conversation session management
+│   └── creation/manager.ts         # Research creation workflows
+│
+web/                                # ── Web Frontend (React + Vite) ──
+├── src/
+│   ├── components/
+│   │   ├── graph/                  # ClaimGraphView, ClaimNode, ClaimDetailDrawer
+│   │   ├── experiments/            # ExperimentDashboard, MetricsTable, FigureGallery
+│   │   ├── research/               # OrchestratorStatus, StabilityCard, BudgetCard
+│   │   ├── chat/                   # ChatPanel with streaming
+│   │   └── shared/                 # Card, Badge, MarkdownViewer
+│   ├── stores/                     # Zustand: session, ws, ui, experiment, chat
+│   ├── api/                        # HTTP client + WebSocket JSON-RPC
+│   └── hooks/                      # useClaimGraph, useResearchPolling
+│
+agents/                             # LLM prompt templates
+├── investigator.md                 # Literature search + verification
+├── experiment-runner.md            # Code generation + execution
+├── result-analyzer.md              # Experiment analysis + figures
+├── math-reasoner.md                # Theorem proving
+├── fragment-writer.md              # LaTeX fragment authoring
+├── paper-assembler.md              # Fragment → complete paper
+├── latex-compiler.md               # Compilation + error fixing
+├── reviewer.md                     # 7-dimension peer review
+├── revision-handler.md             # Review comment triage
+└── data-scout.md                   # Data availability investigation
 
-agents/                          # LLM prompt templates for specialized agents
-├── investigator.md              # Literature search + verification
-├── experiment-runner.md         # Code generation + execution
-├── result-analyzer.md           # Experiment result analysis + figures
-├── math-reasoner.md             # Theorem proving
-├── fragment-writer.md           # LaTeX fragment authoring
-├── paper-assembler.md           # Fragment → complete paper
-├── latex-compiler.md            # LaTeX compilation + error fixing
-├── reviewer.md                  # 7-dimension peer review
-├── revision-handler.md          # Review comment triage + fixes
-└── data-scout.md                # Data availability investigation
-
-templates/                       # Venue-specific LaTeX templates
-├── neurips/                     # NeurIPS 2026
-├── icml/                        # ICML 2026
-├── aaai/                        # AAAI 2026
-├── acl/                         # ACL 2026
-├── jfe/                         # Journal of Financial Economics
-├── rfs/                         # Review of Financial Studies
-└── custom/                      # Generic fallback
+templates/                          # Venue-specific LaTeX templates
+├── neurips/                        # NeurIPS 2026
+├── icml/                           # ICML 2026
+├── aaai/                           # AAAI 2026
+├── acl/                            # ACL 2026
+├── jfe/                            # Journal of Financial Economics
+├── rfs/                            # Review of Financial Studies
+└── custom/                         # Generic fallback
 ```
 
 ### Context Management
 
 A mid-stage research project can serialize to 70,000+ tokens. Dumping that into context destroys performance.
 
-Claude Paper uses a three-layer compression system inspired by LCM (Lossless Context Management):
+Claude Paper uses a three-layer compression system:
 
 - **L0** (~300 tokens): Statistical overview — "50 claims, 18 admitted, 72% coverage"
 - **L1** (~1,500 tokens): Key claims — admitted skeleton, three weakest bridges, recent changes
@@ -175,7 +244,9 @@ Each role sees a **different subgraph**: Builder sees the frontier, Skeptic sees
 | review | GPT-5.4 | Skeptic phase, peer review |
 | quick | Claude Opus 4.6 | Lightweight tasks |
 
-All configurable via `/settings` or `~/.claude-paper/config.json`.
+**Additional providers supported:** DeepSeek (V3, reasoner, coder), Qwen (Max, Plus, Turbo, Long), GLM (4-Plus, 4-Flash, 4-Long), AWS Bedrock, Vertex AI.
+
+All configurable via `/settings`, the Web UI settings page, or `~/.claude-paper/config.json`.
 
 ---
 
@@ -193,7 +264,7 @@ export ANTHROPIC_API_KEY="your-key"
 export OPENAI_API_KEY="your-key"        # for reasoning/review models
 export S2_API_KEY="your-key"            # optional, for Semantic Scholar
 
-# Build and run
+# Build and run CLI
 bun run build
 ./cli.js
 
@@ -201,7 +272,23 @@ bun run build
 bun run dev
 ```
 
+### Web UI Setup
+
+```bash
+# Terminal 1: Backend server
+bun run src/entrypoints/web.ts
+
+# Terminal 2: Frontend dev server
+cd web
+bun install
+npx vite
+
+# Open http://localhost:5173
+```
+
 ## Quick Start
+
+### CLI
 
 ```bash
 # Inside the Claude Paper CLI:
@@ -237,6 +324,16 @@ bun run dev
 /deliver --format arxiv
 ```
 
+### Web UI
+
+1. Open `http://localhost:5173`
+2. Click an existing session or create new research
+3. Use the right panel to monitor Pipeline, Literature, Claims, and Experiments
+4. Click **Start Interactive** to begin the orchestrator — approve/skip/edit each decision as it arrives
+5. Click **Start Auto** for hands-free autonomous research
+6. Open the **Claim Graph** to visualize the epistemic structure
+7. Switch to the **Experiments** tab to track probes and publication-grade runs
+
 ---
 
 ## Commands
@@ -267,7 +364,9 @@ bun run dev
 
 ---
 
-## Experiment System
+## Key Subsystems
+
+### Experiment System
 
 Experiments have a full lifecycle with three tiers:
 
@@ -281,9 +380,9 @@ Every experiment auto-generates a structured notebook (**NOTE.md**): why it was 
 
 Resource estimation runs before execution — GPU, memory, disk, and runtime requirements are checked against available hardware. OOM errors trigger automatic batch size reduction and retry.
 
-## Writing Pipeline
+### Writing Pipeline
 
-Paper writing is not a single "generate text" step. It follows a structured pipeline:
+Paper writing follows a structured 8-phase pipeline:
 
 1. **Narrative planning** — extract the research story from the ClaimGraph: hook (why should readers care?), gap (what's missing?), insight (what did we discover?), method, evidence, nuance. Generate section-by-section plans with page budgets fitted to the target venue.
 2. **Section writing** — each section is written from its narrative plan, drawing on fragments (proofs, experiment descriptions, tables) already produced during research. Sections are independent LaTeX files.
@@ -292,7 +391,7 @@ Paper writing is not a single "generate text" step. It follows a structured pipe
 5. **Compilation** — `latexmk` with rule-based error diagnosis. Common issues (missing packages, undefined commands, reference errors) are fixed automatically; stubborn errors go to an LLM for diagnosis. Up to 15 retry rounds.
 6. **Page check** — if the compiled PDF exceeds the venue page limit, intelligent cuts are suggested and applied.
 
-## Review System
+### Review System
 
 Review isn't vague "soundness 7/10." It generates 15-25 **atomic, objectively verifiable checklist items** from the ClaimGraph — "Does MS-GARCH achieve p<0.05 on the DM test vs GARCH?" is a valid rubric item; "Is the methodology rigorous?" is not.
 
@@ -300,7 +399,7 @@ Each reviewer scores 7 dimensions: originality, significance, soundness, clarity
 
 Configurable via flags: `--strength` (light/standard/thorough/brutal), `--reviewers` (number of parallel reviewers), `--grounded` (force literature grounding).
 
-## Domain Knowledge Packs
+### Domain Knowledge Packs
 
 Domain knowledge packs (DKPs) let you extract structured knowledge from textbooks and papers — theorems, definitions, algorithms, propositions — into a searchable, citation-ready format.
 
@@ -321,31 +420,33 @@ Each pack contains entries with formal statements, assumptions, proof sketches, 
 
 ## Configuration
 
-Claude Paper is configured through `~/.claude-paper/config.json` and the `/settings` command.
+Claude Paper is configured through `~/.claude-paper/config.json`, the `/settings` command, or the Web UI settings page.
 
 Key configuration areas:
-- **Model assignments** — which LLM handles each role (research, reasoning, coding, writing, review)
+
+- **Model assignments** — which LLM handles each role (research, reasoning, coding, writing, review), per-role temperature and token limits
 - **Paper settings** — template, compiler (pdflatex/xelatex/lualatex), language, max pages, target venue
 - **Literature** — source APIs, arXiv categories, max papers, year range, citation threshold
 - **Experiments** — Python version, GPU requirements, max runtime, auto-retry settings
 - **Review** — number of reviewers, max revision rounds, acceptance threshold
 - **Budget** — total USD cap, warning percentage
+- **Rigor level** — `1` (exploratory), `2` (standard), `3` (thorough)
 
 ## Development
 
 ```bash
 bun install              # install dependencies
 bun run build            # production build (esbuild → dist/)
-bun run dev              # run in development mode
+bun run dev              # run CLI in development mode
 
+# Web UI development
+bun run src/entrypoints/web.ts   # backend
+cd web && npx vite               # frontend with HMR
+
+# Quality
 bun test                 # run all tests
-bun test tests/unit      # unit tests only
-bun test tests/e2e       # end-to-end tests only
-
 bun run lint             # eslint (zero warnings allowed)
-bun run lint:fix         # eslint with auto-fix
 bun run format           # prettier format
-bun run format:check     # check formatting
 bun run typecheck        # tsc --noEmit
 ```
 
