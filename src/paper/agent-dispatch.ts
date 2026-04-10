@@ -5,13 +5,58 @@ import {
   writeFileSync,
   mkdirSync,
 } from 'fs'
-import { join, basename, dirname, resolve, isAbsolute } from 'path'
+import { join, basename, dirname } from 'path'
 import { Glob } from 'bun'
 import matter from 'gray-matter'
-import { chatCompletion, type UnifiedMessage } from './llm-client'
+import { chatCompletion, estimateCost, type UnifiedMessage } from './llm-client'
 import { buildStateContext, type ResearchState } from './research-state'
 import { DKPLoader } from './domain-knowledge/loader'
-import type { KnowledgeEntry, ConnectionGraph } from './domain-knowledge/types'
+import type { KnowledgeEntry } from './domain-knowledge/types'
+import {
+  executionContext,
+  getWorkingDir,
+  getEffectiveDKPLoader,
+  resolvePath,
+  setActiveWorkingDir,
+  setActiveDKPLoader,
+  type ExecutionContext,
+} from './tools/tool-context'
+import {
+  executeWebSearch,
+  executeWebFetch,
+  executeGitHubSearch,
+  executeGitHubReadFile,
+  executeGitHubClone,
+  executeWolframAlpha,
+  executeSympyEval,
+  executeHFSearchModels,
+  executeHFSearchDatasets,
+  executeHFModelInfo,
+  executeHFDatasetPreview,
+  executeOpenAlexSearch,
+  executeDblpSearch,
+  executeImageAnalyze,
+  WEB_TOOLS,
+  GITHUB_TOOLS,
+  MATH_TOOLS,
+  HF_TOOLS,
+  ACADEMIC_TOOLS,
+} from './tools/external-tools'
+import {
+  executeBibTeXLookup,
+  executeBibTeXManage,
+  executeLatexCompile,
+  executeLatexCheck,
+  executeDataQuery,
+  executePlotCreate,
+  executeDockerRun,
+  executeDockerBuild,
+  executeDockerList,
+  executeSQLiteQuery,
+  CITATION_TOOLS,
+  DATA_TOOLS,
+  INFRA_TOOLS,
+} from './tools/paper-tools'
 import { DEFAULT_MODEL_ASSIGNMENTS } from './types'
 import type {
   ExecutionResult,
@@ -19,6 +64,13 @@ import type {
   KnownResultFinding,
   CitationFinding,
 } from './orchestrator'
+
+// ── Execution Context (re-exported from tools/tool-context) ──
+// The ExecutionContext interface, executionContext AsyncLocalStorage,
+// setActiveWorkingDir, getWorkingDir, resolvePath, and DKP helpers
+// are defined in tools/tool-context.ts and re-exported here for
+// backward compatibility with existing importers.
+export { executionContext, setActiveWorkingDir, type ExecutionContext }
 
 // ── Agent Template Loading ──────────────────────────────
 
@@ -127,6 +179,9 @@ function resolveModelSpec(roleOrModel?: string): string {
   ) {
     return `anthropic:${roleOrModel}`
   }
+  if (roleOrModel.includes('deepseek')) return `deepseek:${roleOrModel}`
+  if (roleOrModel.includes('qwen')) return `qwen:${roleOrModel}`
+  if (roleOrModel.includes('glm')) return `glm:${roleOrModel}`
 
   // Unknown role, fall back to research
   return DEFAULT_MODEL_ASSIGNMENTS.research
@@ -143,18 +198,11 @@ export function extractModelId(modelSpec: string): string {
 
 // ── Tool Definitions for Agents ─────────────────────────
 
-// Tool definitions use Anthropic tool format (also used by chatCompletion unified API)
-interface ToolDefinition {
-  name: string
-  description: string
-  input_schema: {
-    type: 'object'
-    properties: Record<string, unknown>
-    required: string[]
-  }
-}
+// Re-export ToolDefinition from tool-context (single source of truth)
+export type { ToolDefinition } from './tools/tool-context'
+import type { ToolDefinition } from './tools/tool-context'
 
-const BASE_TOOLS: ToolDefinition[] = [
+export const BASE_TOOLS: ToolDefinition[] = [
   {
     name: 'bash',
     description:
@@ -253,7 +301,7 @@ const BASE_TOOLS: ToolDefinition[] = [
   },
 ]
 
-const RESEARCH_TOOLS: ToolDefinition[] = [
+export const RESEARCH_TOOLS: ToolDefinition[] = [
   {
     name: 'arxiv_search',
     description:
@@ -373,7 +421,7 @@ const RESEARCH_TOOLS: ToolDefinition[] = [
   },
 ]
 
-const DK_TOOLS: ToolDefinition[] = [
+export const DK_TOOLS: ToolDefinition[] = [
   {
     name: 'dk_search',
     description:
@@ -454,19 +502,57 @@ const DK_TOOLS: ToolDefinition[] = [
   },
 ]
 
-/**
- * DKPLoader instance shared across agent executions within a session.
- * Initialized lazily by initAgentDKP() when knowledge packs are loaded.
- */
-let activeDKPLoader: DKPLoader | null = null
+// Extended tool definitions are co-located with their executors:
+// - WEB_TOOLS, GITHUB_TOOLS, MATH_TOOLS, HF_TOOLS, ACADEMIC_TOOLS → ./tools/external-tools.ts
+// - CITATION_TOOLS, DATA_TOOLS, INFRA_TOOLS → ./tools/paper-tools.ts
+// Re-export for backward compatibility with existing importers.
+export {
+  WEB_TOOLS, GITHUB_TOOLS, MATH_TOOLS, HF_TOOLS, ACADEMIC_TOOLS,
+} from './tools/external-tools'
+export {
+  CITATION_TOOLS, DATA_TOOLS, INFRA_TOOLS,
+} from './tools/paper-tools'
+
 
 /** Initialize DKP loader for agent tool execution. Called by orchestrator. */
 export function initAgentDKP(state: ResearchState, packsDir?: string): void {
-  const packIds = state.loaded_knowledge_packs ?? []
-  if (packIds.length === 0) {
-    activeDKPLoader = null
+  setActiveDKPLoader(createDKPLoaderForState(state, packsDir))
+}
+
+/**
+ * Initialize DKP loader for a conversation-mode session.
+ * Takes a pack ID directly (from SessionState.knowledge_pack_id) instead of
+ * requiring a ResearchState. Uses the same activeDKPLoader global — safe because
+ * Bun is single-threaded and ChatManager.processing prevents concurrent execution.
+ * Same pattern as setActiveWorkingDir().
+ */
+export function initDKPForSession(packId: string | null, packsDir?: string): void {
+  if (!packId) {
+    setActiveDKPLoader(null)
     return
   }
+  const loader = new DKPLoader(packsDir)
+  try {
+    loader.load(packId)
+    setActiveDKPLoader(loader)
+  } catch (err) {
+    setActiveDKPLoader(null)
+    console.warn(`[DKP] Failed to load pack "${packId}":`, (err as Error).message)
+  }
+}
+
+/** Get the active DKPLoader instance — from context if available, else legacy global. */
+export function getActiveDKPLoader(): DKPLoader | null {
+  return getEffectiveDKPLoader()
+}
+
+/**
+ * Create a DKP loader for a research state WITHOUT setting the global.
+ * Used by executionContext-based parallel execution.
+ */
+function createDKPLoaderForState(state: ResearchState, packsDir?: string): DKPLoader | null {
+  const packIds = state.loaded_knowledge_packs ?? []
+  if (packIds.length === 0) return null
   const loader = new DKPLoader(packsDir)
   let loadedAny = false
   for (const packId of packIds) {
@@ -477,17 +563,14 @@ export function initAgentDKP(state: ResearchState, packsDir?: string): void {
       // Pack not found on disk — skip
     }
   }
-  activeDKPLoader = loadedAny ? loader : null
+  return loadedAny ? loader : null
 }
 
-/** Get the active DKPLoader instance (set by initAgentDKP). */
-export function getActiveDKPLoader(): DKPLoader | null {
-  return activeDKPLoader
-}
 
 /** Check if DK tools should be included for this agent. */
 function shouldIncludeDKTools(agentName: string): boolean {
-  if (!activeDKPLoader || activeDKPLoader.getLoadedPacks().length === 0)
+  const loader = getEffectiveDKPLoader()
+  if (!loader || loader.getLoadedPacks().length === 0)
     return false
   // Per knowledge.md spec: math-reasoner, investigator, experiment-runner, fragment-writer
   const dkAgents = [
@@ -499,6 +582,29 @@ function shouldIncludeDKTools(agentName: string): boolean {
     'result-analyzer',
   ]
   return dkAgents.includes(agentName)
+}
+
+/**
+ * Map agent names to extended tool sets beyond BASE_TOOLS + RESEARCH_TOOLS.
+ * Each agent gets the tools relevant to its role in the research pipeline.
+ */
+const AGENT_EXTENDED_TOOLS: Record<string, ToolDefinition[][]> = {
+  // investigator: literature search across all sources + web/github for implementations
+  'investigator': [WEB_TOOLS, GITHUB_TOOLS, ACADEMIC_TOOLS, HF_TOOLS],
+  // data-scout: find datasets, models, implementations
+  'data-scout': [WEB_TOOLS, GITHUB_TOOLS, HF_TOOLS, ACADEMIC_TOOLS, DATA_TOOLS],
+  // result-analyzer: analyze data, create plots, compute math
+  'result-analyzer': [DATA_TOOLS, MATH_TOOLS],
+  // fragment-writer: LaTeX/BibTeX management, math for proofs
+  'fragment-writer': [CITATION_TOOLS, MATH_TOOLS],
+  // math-reasoner: symbolic math + data analysis
+  'math-reasoner': [MATH_TOOLS, DATA_TOOLS],
+  // experiment-runner: docker for isolated experiments, data analysis, plotting
+  'experiment-runner': [DATA_TOOLS, INFRA_TOOLS, MATH_TOOLS],
+  // latex-compiler: LaTeX compilation and checking
+  'latex-compiler': [CITATION_TOOLS],
+  // paper-assembler: citation management
+  'paper-assembler': [CITATION_TOOLS],
 }
 
 /** Get tools for an agent, respecting the template's tools field when available */
@@ -532,34 +638,44 @@ function getAgentTools(
     }
   }
 
+  // Extended tools for this agent (role-based)
+  const extendedArrays = AGENT_EXTENDED_TOOLS[agentName] ?? []
+  const extendedTools = extendedArrays.flat()
+
+  // All known tool arrays for template matching
+  const allToolArrays = [
+    ...BASE_TOOLS, ...RESEARCH_TOOLS, ...DK_TOOLS,
+    ...WEB_TOOLS, ...GITHUB_TOOLS, ...MATH_TOOLS,
+    ...HF_TOOLS, ...ACADEMIC_TOOLS, ...CITATION_TOOLS,
+    ...DATA_TOOLS, ...INFRA_TOOLS,
+  ]
+
   // If the agent template specifies tools, filter to those + base tools
   if (templateTools && templateTools.length > 0) {
-    const allTools = [...BASE_TOOLS, ...RESEARCH_TOOLS, ...DK_TOOLS]
     const requestedNames = new Set(templateTools.map(t => t.toLowerCase()))
 
-    // Always include base tools; add research tools only if requested
+    // Always include base tools; add requested tools from all known arrays
     const selectedTools = [...BASE_TOOLS]
-    for (const tool of RESEARCH_TOOLS) {
-      if (requestedNames.has(tool.name)) {
+    for (const tool of allToolArrays) {
+      if (requestedNames.has(tool.name) && !selectedTools.find(t => t.name === tool.name)) {
         selectedTools.push(tool)
       }
     }
     // Add DK tools matching request or all filtered DK tools if agent qualifies
     for (const tool of filteredDK) {
       if (requestedNames.has(tool.name) || !requestedNames.has('dk_search')) {
-        // Include filtered DK tools automatically (don't require explicit listing)
         if (!selectedTools.find(t => t.name === tool.name)) {
           selectedTools.push(tool)
         }
       }
     }
-    // If template requested any research-adjacent tool names not in our registry,
-    // include all research tools (template may use generic names like 'search')
+    // If template requested any tool names not in our registry,
+    // include all research + extended tools (template may use generic names)
     const hasUnknown = templateTools.some(
-      t => !allTools.find(at => at.name === t.toLowerCase()),
+      t => !allToolArrays.find(at => at.name === t.toLowerCase()),
     )
     if (hasUnknown) {
-      return [...BASE_TOOLS, ...RESEARCH_TOOLS, ...filteredDK]
+      return [...BASE_TOOLS, ...RESEARCH_TOOLS, ...extendedTools, ...filteredDK]
     }
     return selectedTools
   }
@@ -571,34 +687,15 @@ function getAgentTools(
     'result-analyzer',
     'fragment-writer',
   ]
-  if (researchAgents.includes(agentName)) {
-    return [...BASE_TOOLS, ...RESEARCH_TOOLS, ...filteredDK]
+  if (researchAgents.includes(agentName) || extendedTools.length > 0) {
+    return [...BASE_TOOLS, ...RESEARCH_TOOLS, ...extendedTools, ...filteredDK]
   }
   return [...BASE_TOOLS, ...filteredDK]
 }
 
 // ── Tool Execution ──────────────────────────────────────
 
-// Active working directory for the current agent execution.
-// Set by executeAgent() before the tool loop starts.
-let activeWorkingDir: string = process.cwd()
-
-function resolvePath(filePath: string): string {
-  const projectRoot = activeWorkingDir
-  // Resolve relative to project root, then normalize
-  const resolved = isAbsolute(filePath)
-    ? resolve(filePath)
-    : resolve(projectRoot, filePath)
-  // Prevent path traversal outside the project directory
-  if (!resolved.startsWith(projectRoot + '/') && resolved !== projectRoot) {
-    throw new Error(
-      `Path "${filePath}" resolves outside project directory. Access denied.`,
-    )
-  }
-  return resolved
-}
-
-async function executeTool(
+export async function executeTool(
   toolName: string,
   toolInput: Record<string, unknown>,
 ): Promise<string> {
@@ -644,6 +741,62 @@ async function executeTool(
       return executeDKNavigate(toolInput)
     case 'dk_find_technique':
       return executeDKFindTechnique(toolInput)
+    // Web tools
+    case 'web_search':
+      return executeWebSearch(toolInput)
+    case 'web_fetch':
+      return executeWebFetch(toolInput)
+    // GitHub tools
+    case 'github_search':
+      return executeGitHubSearch(toolInput)
+    case 'github_read_file':
+      return executeGitHubReadFile(toolInput)
+    case 'github_clone':
+      return executeGitHubClone(toolInput)
+    // Math tools
+    case 'wolfram_alpha':
+      return executeWolframAlpha(toolInput)
+    case 'sympy_eval':
+      return executeSympyEval(toolInput)
+    // HuggingFace tools
+    case 'hf_search_models':
+      return executeHFSearchModels(toolInput)
+    case 'hf_search_datasets':
+      return executeHFSearchDatasets(toolInput)
+    case 'hf_model_info':
+      return executeHFModelInfo(toolInput)
+    case 'hf_dataset_preview':
+      return executeHFDatasetPreview(toolInput)
+    // Academic tools
+    case 'openalex_search':
+      return executeOpenAlexSearch(toolInput)
+    case 'dblp_search':
+      return executeDblpSearch(toolInput)
+    case 'image_analyze':
+      return executeImageAnalyze(toolInput)
+    // Citation tools
+    case 'bibtex_lookup':
+      return executeBibTeXLookup(toolInput)
+    case 'bibtex_manage':
+      return executeBibTeXManage(toolInput)
+    case 'latex_compile':
+      return executeLatexCompile(toolInput)
+    case 'latex_check':
+      return executeLatexCheck(toolInput)
+    // Data tools
+    case 'data_query':
+      return executeDataQuery(toolInput)
+    case 'plot_create':
+      return executePlotCreate(toolInput)
+    // Infrastructure tools
+    case 'docker_run':
+      return executeDockerRun(toolInput)
+    case 'docker_build':
+      return executeDockerBuild(toolInput)
+    case 'docker_list':
+      return executeDockerList(toolInput)
+    case 'sqlite_query':
+      return executeSQLiteQuery(toolInput)
     default:
       return `Error: Unknown tool "${toolName}"`
   }
@@ -654,7 +807,7 @@ async function executeBash(
   timeoutMs: number,
 ): Promise<string> {
   const clampedTimeout = Math.min(Math.max(timeoutMs, 1000), 300_000)
-  const projectDir = activeWorkingDir
+  const projectDir = getWorkingDir()
 
   try {
     // Sandbox: override HOME and TMPDIR so agents stay inside the project.
@@ -745,7 +898,7 @@ async function executeListFiles(
   cwd?: string,
 ): Promise<string> {
   try {
-    const searchDir = cwd ? resolvePath(cwd) : activeWorkingDir
+    const searchDir = cwd ? resolvePath(cwd) : getWorkingDir()
     const glob = new Glob(pattern)
     const matches: string[] = []
     for await (const file of glob.scan({ cwd: searchDir, dot: false })) {
@@ -770,7 +923,7 @@ async function executeGrepContent(
   glob?: string,
 ): Promise<string> {
   try {
-    const searchDir = path ? resolvePath(path) : activeWorkingDir
+    const searchDir = path ? resolvePath(path) : getWorkingDir()
     const args = ['rg', '--max-count=50', '--line-number']
     if (glob) args.push('--glob', glob)
     args.push(pattern, searchDir)
@@ -823,6 +976,7 @@ async function executeResearchTool(
         const args = [
           'python3',
           scriptPath,
+          '--query',
           query,
           '--max-results',
           String(maxResults),
@@ -843,45 +997,27 @@ async function executeResearchTool(
         const paperId = input.paper_id as string | undefined
         const maxResults = (input.max_results as number) ?? 10
         const s2Key = process.env.S2_API_KEY ?? ''
-        const headers = s2Key ? `-H "x-api-key: ${s2Key}"` : ''
+        const s2Headers: Record<string, string> = {}
+        if (s2Key) s2Headers['x-api-key'] = s2Key
 
+        const fields = 'title,authors,year,abstract,citationCount'
+        let s2Url: string
         if (action === 'citations' && paperId) {
-          const proc = Bun.spawn(
-            [
-              'bash',
-              '-c',
-              `curl -s ${headers} "https://api.semanticscholar.org/graph/v1/paper/${paperId}/citations?limit=${maxResults}&fields=title,authors,year,abstract,citationCount"`,
-            ],
-            { stdout: 'pipe', stderr: 'pipe' },
-          )
-          return await new Response(proc.stdout).text()
+          s2Url = `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(paperId)}/citations?limit=${maxResults}&fields=${fields}`
+        } else if (action === 'references' && paperId) {
+          s2Url = `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(paperId)}/references?limit=${maxResults}&fields=${fields}`
+        } else {
+          const encodedQuery = encodeURIComponent(query)
+          s2Url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodedQuery}&limit=${maxResults}&fields=${fields},url`
         }
-        if (action === 'references' && paperId) {
-          const proc = Bun.spawn(
-            [
-              'bash',
-              '-c',
-              `curl -s ${headers} "https://api.semanticscholar.org/graph/v1/paper/${paperId}/references?limit=${maxResults}&fields=title,authors,year,abstract,citationCount"`,
-            ],
-            { stdout: 'pipe', stderr: 'pipe' },
-          )
-          return await new Response(proc.stdout).text()
-        }
-        const encodedQuery = encodeURIComponent(query)
-        const proc = Bun.spawn(
-          [
-            'bash',
-            '-c',
-            `curl -s ${headers} "https://api.semanticscholar.org/graph/v1/paper/search?query=${encodedQuery}&limit=${maxResults}&fields=title,authors,year,abstract,citationCount,url"`,
-          ],
-          { stdout: 'pipe', stderr: 'pipe' },
-        )
-        return await new Response(proc.stdout).text()
+        const s2Resp = await fetch(s2Url, { headers: s2Headers })
+        if (!s2Resp.ok) return `Semantic Scholar API error: ${s2Resp.status} ${s2Resp.statusText}`
+        return await s2Resp.text()
       }
       case 'paperqa_query': {
         const query = input.query as string
         const action = (input.action as string) ?? 'ask'
-        const litDir = join(activeWorkingDir, 'literature')
+        const litDir = join(getWorkingDir(), 'literature')
         const proc = Bun.spawn(['pqa', action, query, '--directory', litDir], {
           stdout: 'pipe',
           stderr: 'pipe',
@@ -897,9 +1033,9 @@ async function executeResearchTool(
       }
       case 'paper_download': {
         const url = input.url as string
-        const outputDir =
-          (input.output_dir as string) ??
-          join(activeWorkingDir, 'literature/papers')
+        const outputDir = resolvePath(
+          (input.output_dir as string) ?? 'literature/papers'
+        )
         mkdirSync(outputDir, { recursive: true })
         const filename =
           (input.paper_id as string)?.replace(/[^a-zA-Z0-9.-]/g, '_') ?? 'paper'
@@ -917,13 +1053,14 @@ async function executeResearchTool(
           : `Download failed — file not created`
       }
       case 'pdf_extract': {
-        const pdfPath = input.pdf_path as string
+        const pdfPath = resolvePath(input.pdf_path as string)
         if (!existsSync(pdfPath)) {
           return `PDF file not found: ${pdfPath}`
         }
-        const outputDir =
+        const outputDir = resolvePath(
           (input.output_dir as string) ??
-          join(pdfPath.replace(/\.pdf$/i, ''), '_extracted')
+          pdfPath.replace(/\.pdf$/i, '') + '_extracted'
+        )
         mkdirSync(outputDir, { recursive: true })
         const scriptPath = join(
           import.meta.dir,
@@ -963,6 +1100,7 @@ async function executeResearchTool(
 // ── Domain Knowledge Tool Execution ──────────────────────
 
 function executeDKSearch(input: Record<string, unknown>): string {
+  const activeDKPLoader = getEffectiveDKPLoader()
   if (!activeDKPLoader) return 'No knowledge packs loaded.'
 
   const query = (input.query as string) ?? ''
@@ -1059,6 +1197,7 @@ function executeDKSearch(input: Record<string, unknown>): string {
 }
 
 function executeDKExpand(input: Record<string, unknown>): string {
+  const activeDKPLoader = getEffectiveDKPLoader()
   if (!activeDKPLoader) return 'No knowledge packs loaded.'
 
   const entryId = (input.entry_id as string) ?? ''
@@ -1129,6 +1268,7 @@ function executeDKExpand(input: Record<string, unknown>): string {
 }
 
 function executeDKNavigate(input: Record<string, unknown>): string {
+  const activeDKPLoader = getEffectiveDKPLoader()
   if (!activeDKPLoader) return 'No knowledge packs loaded.'
 
   const entryId = (input.entry_id as string) ?? ''
@@ -1196,6 +1336,7 @@ function executeDKNavigate(input: Record<string, unknown>): string {
 }
 
 function executeDKFindTechnique(input: Record<string, unknown>): string {
+  const activeDKPLoader = getEffectiveDKPLoader()
   if (!activeDKPLoader) return 'No knowledge packs loaded.'
 
   const technique = ((input.technique as string) ?? '').toLowerCase()
@@ -1275,6 +1416,40 @@ function formatToolProgress(
       return `navigating ${(input.direction as string) ?? ''}: ${(input.entry_id as string) ?? ''}`
     case 'dk_find_technique':
       return `finding technique: "${(input.technique as string)?.slice(0, 40)}"`
+    case 'hf_search_models':
+      return `searching HuggingFace models: "${(input.query as string)?.slice(0, 50)}"`
+    case 'hf_search_datasets':
+      return `searching HuggingFace datasets: "${(input.query as string)?.slice(0, 50)}"`
+    case 'hf_model_info':
+      return `fetching model info: ${(input.model_id as string) ?? ''}`
+    case 'hf_dataset_preview':
+      return `previewing dataset: ${(input.dataset_id as string) ?? ''}`
+    case 'openalex_search':
+      return `searching OpenAlex: "${(input.query as string)?.slice(0, 50)}"`
+    case 'dblp_search':
+      return `searching DBLP: "${(input.query as string)?.slice(0, 50)}"`
+    case 'image_analyze':
+      return `analyzing image: ${basename((input.image_path as string) ?? '')}`
+    case 'bibtex_lookup':
+      return `looking up BibTeX: ${(input.arxiv_id as string) ?? (input.doi as string) ?? (input.s2_id as string) ?? ''}`
+    case 'bibtex_manage':
+      return `BibTeX ${(input.action as string) ?? 'manage'}: ${basename((input.bib_path as string) ?? 'references.bib')}`
+    case 'latex_compile':
+      return `compiling LaTeX: ${basename((input.tex_file as string) ?? 'main.tex')}`
+    case 'latex_check':
+      return `checking LaTeX: ${basename((input.tex_file as string) ?? '')}`
+    case 'data_query':
+      return `running SQL query`
+    case 'plot_create':
+      return `creating ${(input.chart_type as string) ?? 'chart'}`
+    case 'docker_run':
+      return `running in Docker: ${(input.image as string) ?? ''}`
+    case 'docker_build':
+      return `building Docker image: ${(input.tag as string) ?? ''}`
+    case 'docker_list':
+      return `listing Docker images/containers`
+    case 'sqlite_query':
+      return `querying SQLite: ${basename((input.db_path as string) ?? '')}`
     default:
       return toolName
   }
@@ -1390,8 +1565,18 @@ export async function executeAgent(
 
   // Resolve the working directory: session dir if available, else cwd
   const workingDir = sessionDir ?? process.cwd()
-  // Set module-level working dir so tool execution functions use it
-  activeWorkingDir = workingDir
+
+  // Create scoped execution context for this agent — provides isolated
+  // workingDir and dkpLoader via AsyncLocalStorage, safe for parallel dispatch.
+  const ctx: ExecutionContext = {
+    workingDir,
+    dkpLoader: createDKPLoaderForState(state),
+  }
+
+  return executionContext.run(ctx, async () => {
+  // NOTE: Legacy globals (activeWorkingDir, activeDKPLoader) are NOT set here.
+  // All tool executors use getWorkingDir() and getEffectiveDKPLoader() which
+  // read from AsyncLocalStorage context first, making parallel dispatch safe.
 
   const systemPrompt = `${template.systemPrompt}
 
@@ -1488,6 +1673,9 @@ When you have finished, provide your final results in the following JSON format 
       // Execute tool calls and collect results
       const toolResultParts: string[] = []
       for (const tc of response.tool_calls) {
+        // No need to re-set globals per tool call — executionContext.run() provides
+        // isolated workingDir and dkpLoader via AsyncLocalStorage, safe across awaits.
+
         // Report progress: what tool is being called and with what input
         if (onProgress) {
           const toolLabel = formatToolProgress(tc.name, tc.input)
@@ -1509,7 +1697,7 @@ When you have finished, provide your final results in the following JSON format 
       messages.push({
         role: 'assistant',
         content:
-          response.text +
+          (response.text ?? '') +
           (response.tool_calls
             ? '\n' +
               response.tool_calls.map(tc => `[calling ${tc.name}]`).join('\n')
@@ -1530,7 +1718,7 @@ When you have finished, provide your final results in the following JSON format 
     const jsonMatch = finalText.match(/```json\s*([\s\S]*?)\s*```/)
     const parsed = jsonMatch ? safeParseJSON(jsonMatch[1]) : null
 
-    const costUsd = estimateCallCost(
+    const costUsd = estimateCost(
       totalInputTokens,
       totalOutputTokens,
       modelSpec,
@@ -1628,6 +1816,46 @@ When you have finished, provide your final results in the following JSON format 
       cost_usd: 0,
     }
   }
+
+  }) // end executionContext.run()
+}
+
+/**
+ * Execute multiple agents in parallel using Promise.allSettled.
+ * Each agent runs in its own AsyncLocalStorage execution context,
+ * so they can safely share the event loop without clobbering globals.
+ *
+ * Returns results in the same order as the input array.
+ * Failed agents return error ExecutionResults rather than throwing.
+ */
+export async function executeAgentsParallel(
+  agents: Array<{
+    agentName: string
+    task: string
+    context: string
+    state: ResearchState
+    onProgress?: (message: string) => void
+    sessionDir?: string
+  }>,
+): Promise<ExecutionResult[]> {
+  const promises = agents.map(a =>
+    executeAgent(a.agentName, a.task, a.context, a.state, a.onProgress, a.sessionDir),
+  )
+
+  const settled = await Promise.allSettled(promises)
+
+  return settled.map((result, i) => {
+    if (result.status === 'fulfilled') return result.value
+    return {
+      success: false,
+      agent: agents[i].agentName,
+      summary: `Parallel execution failed: ${result.reason instanceof Error ? result.reason.message : String(result.reason ?? 'Unknown error')}`,
+      artifacts_produced: [],
+      new_claims: [],
+      new_evidence: [],
+      cost_usd: 0,
+    }
+  })
 }
 
 // ── Helpers ─────────────────────────────────────────────
@@ -1685,28 +1913,8 @@ function safeParseJSON(text: string): any | null {
   }
 }
 
-function estimateCallCost(
-  inputTokens: number,
-  outputTokens: number,
-  model: string,
-): number {
-  // Pricing per million tokens (2025 rates) — must match llm-client.ts
-  const rates = model.includes('opus')
-    ? { input: 15, output: 75 }
-    : model.includes('haiku')
-      ? { input: 0.25, output: 1.25 }
-      : model.includes('gpt-5')
-        ? { input: 10, output: 30 }
-        : model.includes('gpt-4')
-          ? { input: 2.5, output: 10 }
-          : model.includes('o3') || model.includes('o4')
-            ? { input: 10, output: 40 }
-            : { input: 3, output: 15 } // Sonnet default
-  return (
-    (inputTokens / 1_000_000) * rates.input +
-    (outputTokens / 1_000_000) * rates.output
-  )
-}
+// Cost estimation now uses shared estimateCost() from llm-client.ts
+
 
 // ── Test-only exports ────────────────────────────────────
 export const __test__ = {

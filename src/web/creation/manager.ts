@@ -28,11 +28,14 @@ const MAX_PROPOSAL_COUNT = 3
 const MAX_REDESIGN_ATTEMPTS = 3
 
 function sanitizeTopic(topic: string): string {
-  return topic
+  const slug = topic
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '')
     .slice(0, 60)
+  // Fallback for non-ASCII topics (e.g. Chinese) that produce an empty slug
+  if (!slug) return `session-${Date.now().toString(36)}`
+  return slug
 }
 
 export type CreationPhase =
@@ -174,6 +177,45 @@ export class CreationManager {
       selectedProposal: entry.selectedProposal,
       error: entry.error,
     }
+  }
+
+  /**
+   * Start from an imported Proposal: skip deep research + proposal generation,
+   * go straight to orchestrator initialization.
+   */
+  async startFromProposal(
+    proposal: Proposal,
+    cwd: string,
+    peer: JsonRpcPeer,
+    options?: { budget_usd?: number; max_cycles?: number },
+  ): Promise<string> {
+    const creationId = nanoid()
+    const slug = sanitizeTopic(proposal.title)
+    const projectDir = join(cwd, SESSIONS_DIR_NAME, slug)
+    mkdirSync(projectDir, { recursive: true })
+
+    const entry: RunningCreation = {
+      creationId,
+      topic: proposal.title,
+      cwd,
+      peer,
+      phase: 'orchestrator_init',
+      sessionId: slug,
+      projectDir,
+      proposals: [proposal],
+      selectedProposal: proposal,
+      error: null,
+      aborted: false,
+      proposalResolver: null,
+      options: options ?? {},
+    }
+    this.running.set(creationId, entry)
+
+    this.runFromProposalPipeline(entry, proposal).catch(err => {
+      this.handleError(entry, err)
+    })
+
+    return creationId
   }
 
   /**
@@ -487,6 +529,85 @@ export class CreationManager {
     emit('Research state initialized')
 
     // ── Complete ────────────────────────────────────────────
+    setPhase('complete')
+    peer.sendNotification('creation/complete', {
+      creationId,
+      sessionId: entry.sessionId,
+      projectDir,
+    })
+
+    setTimeout(() => this.running.delete(creationId), 5 * 60 * 1000)
+  }
+
+  /**
+   * Pipeline for imported proposal: skip research + proposal gen,
+   * go straight to state initialization.
+   */
+  private async runFromProposalPipeline(
+    entry: RunningCreation,
+    proposal: Proposal,
+  ): Promise<void> {
+    const { creationId, peer, options, projectDir } = entry
+    if (!projectDir) throw new Error('projectDir is required')
+
+    const emit = (message: string) => {
+      if (entry.aborted) return
+      peer.sendNotification('creation/progress', { creationId, message })
+    }
+
+    const setPhase = (phase: CreationPhase) => {
+      if (entry.aborted) return
+      entry.phase = phase
+      peer.sendNotification('creation/phase', { creationId, phase })
+    }
+
+    setPhase('orchestrator_init')
+    emit(`Initializing from imported proposal: "${proposal.title}"`)
+
+    // Notify client of the selected proposal
+    peer.sendNotification('creation/proposal_selected', {
+      creationId,
+      proposal,
+    })
+
+    if (entry.aborted) return
+
+    // Probe system capabilities
+    let systemCaps = null
+    try {
+      systemCaps = await probeSystem()
+    } catch {
+      emit('System probe failed, proceeding with defaults')
+    }
+
+    if (entry.aborted) return
+
+    const state = initializeFromProposal(proposal, {
+      budget_usd: options.budget_usd,
+      compute: systemCaps,
+      literature_db: join(projectDir, 'literature', 'index'),
+    })
+
+    saveResearchState(projectDir, state)
+
+    // Write session.json
+    const metaPath = join(projectDir, SESSION_META)
+    if (!existsSync(metaPath)) {
+      const meta = {
+        id: entry.sessionId,
+        topic: proposal.title,
+        created_at: new Date().toISOString(),
+        last_active: new Date().toISOString(),
+        imported_proposal: true,
+      }
+      writeFileSync(metaPath, JSON.stringify(meta, null, 2) + '\n', 'utf-8')
+    }
+
+    emit('Research state initialized from imported proposal')
+
+    if (entry.aborted) return
+
+    // Complete
     setPhase('complete')
     peer.sendNotification('creation/complete', {
       creationId,

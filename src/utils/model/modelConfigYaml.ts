@@ -67,6 +67,12 @@ function suggestedApiKeyEnvForProvider(provider: string): string | undefined {
       return 'AZURE_OPENAI_API_KEY'
     case 'gemini':
       return 'GEMINI_API_KEY'
+    case 'deepseek':
+      return 'DEEPSEEK_API_KEY'
+    case 'qwen':
+      return 'DASHSCOPE_API_KEY'
+    case 'glm':
+      return 'ZHIPU_API_KEY'
     default:
       return undefined
   }

@@ -6,11 +6,13 @@ import { join } from 'path'
 import { DEFAULT_MODEL_ASSIGNMENTS } from './types'
 import { addToTotalCost } from '../core/costTracker'
 
+export type PaperProvider = 'anthropic' | 'openai' | 'deepseek' | 'qwen' | 'glm'
+
 let cachedAnthropicClient: Anthropic | null = null
 let cachedOpenAIClient: OpenAI | null = null
 
 interface LoadedConfig {
-  api_keys?: { anthropic?: string; openai?: string }
+  api_keys?: { anthropic?: string; anthropic_auth_token?: string; openai?: string; deepseek?: string; qwen?: string; glm?: string }
   models?: Record<string, string>
   advanced_models?: Record<
     string,
@@ -24,6 +26,20 @@ interface LoadedConfig {
 }
 
 let cachedConfig: LoadedConfig | null = null
+
+/**
+ * Invalidate all cached config and client instances.
+ * Must be called after config is updated (e.g. via web UI settings save).
+ */
+export function invalidateCaches(): void {
+  cachedConfig = null
+  cachedAnthropicClient = null
+  cachedOpenAIClient = null
+  // Clear compat clients (deepseek, qwen, glm)
+  for (const key of Object.keys(cachedCompatClients)) {
+    delete cachedCompatClients[key]
+  }
+}
 
 function loadConfig(): LoadedConfig {
   if (cachedConfig) return cachedConfig
@@ -42,12 +58,20 @@ function loadConfig(): LoadedConfig {
 
 function loadApiKeyFromConfig(): {
   anthropic?: string
+  anthropic_auth_token?: string
   openai?: string
+  deepseek?: string
+  qwen?: string
+  glm?: string
 } {
   const config = loadConfig()
   return {
     anthropic: config?.api_keys?.anthropic,
+    anthropic_auth_token: config?.api_keys?.anthropic_auth_token,
     openai: config?.api_keys?.openai,
+    deepseek: config?.api_keys?.deepseek,
+    qwen: config?.api_keys?.qwen,
+    glm: config?.api_keys?.glm,
   }
 }
 
@@ -106,18 +130,50 @@ let commandUsage: TokenUsage = {
   cost_usd: 0,
 }
 
-function estimateCost(input: number, output: number, model: string): number {
-  const rates = model.includes('opus')
-    ? { input: 15, output: 75 }
-    : model.includes('haiku')
-      ? { input: 0.25, output: 1.25 }
-      : model.includes('gpt-5')
-        ? { input: 10, output: 30 }
-        : model.includes('gpt-4')
-          ? { input: 2.5, output: 10 }
-          : model.includes('o3') || model.includes('o4')
-            ? { input: 10, output: 40 }
-            : { input: 3, output: 15 } // sonnet default
+// Pricing per million tokens (2025 rates).
+// Keys are sorted longest-first so includes() matching picks the most specific entry.
+const COST_TABLE: Record<string, { input: number; output: number }> = {
+  'deepseek-reasoner': { input: 0.55, output: 2.19 },
+  'deepseek-coder': { input: 0.14, output: 0.28 },
+  'deepseek-chat': { input: 0.27, output: 1.10 },
+  'gpt-5.4-mini': { input: 1, output: 5 },
+  'gpt-5.4-pro': { input: 15, output: 60 },
+  'gpt-5.4': { input: 2.5, output: 10 },
+  'glm-4-flash': { input: 0.07, output: 0.07 },
+  'glm-4-plus': { input: 7.14, output: 7.14 },
+  'glm-4-long': { input: 1.43, output: 1.43 },
+  'qwen-turbo': { input: 0.30, output: 0.60 },
+  'qwen-plus': { input: 0.80, output: 2.00 },
+  'qwen-long': { input: 0.07, output: 0.28 },
+  'qwen-max': { input: 2.40, output: 9.60 },
+  'o3-mini': { input: 1.10, output: 4.40 },
+  opus: { input: 15, output: 75 },
+  haiku: { input: 0.25, output: 1.25 },
+  sonnet: { input: 3, output: 15 },
+  'gpt-5': { input: 10, output: 30 },
+  'gpt-4': { input: 2.5, output: 10 },
+  o3: { input: 10, output: 40 },
+  o4: { input: 10, output: 40 },
+}
+
+const DEFAULT_RATES = { input: 3, output: 15 } // Sonnet-tier fallback
+
+// Sorted keys by length descending for most-specific-first matching
+const COST_TABLE_KEYS = Object.keys(COST_TABLE).sort((a, b) => b.length - a.length)
+
+export function estimateCost(input: number, output: number, model: string): number {
+  // Try exact match first
+  let rates = COST_TABLE[model]
+  if (!rates) {
+    // Longest-key-first matching prevents e.g. "gpt-5" from matching before "gpt-5.4-mini"
+    for (const key of COST_TABLE_KEYS) {
+      if (model.includes(key)) {
+        rates = COST_TABLE[key]
+        break
+      }
+    }
+  }
+  if (!rates) rates = DEFAULT_RATES
   return (input / 1_000_000) * rates.input + (output / 1_000_000) * rates.output
 }
 
@@ -211,45 +267,66 @@ export function formatUsage(usage: TokenUsage): string {
 
 // ── Client Factories ─────────────────────────────────────
 
+const ANTHROPIC_SETUP_TOKEN_PREFIX = 'sk-ant-oat01-'
+
+function isSetupToken(value: string): boolean {
+  return value.startsWith(ANTHROPIC_SETUP_TOKEN_PREFIX) && value.length >= 80
+}
+
 /**
  * Get a shared Anthropic client for paper modules.
+ * Supports both API key and setup-token (subscription) authentication.
  * All messages.create() calls are automatically tracked for token usage.
  */
 export function getAnthropicClient(): Anthropic {
   if (cachedAnthropicClient) return cachedAnthropicClient
 
-  let apiKey = process.env.ANTHROPIC_API_KEY
+  const keys = loadApiKeyFromConfig()
 
-  if (!apiKey) {
-    const keys = loadApiKeyFromConfig()
-    apiKey = keys.anthropic
-    if (apiKey) {
+  // 1. Check for setup-token (subscription auth) — env var or config
+  let authToken = process.env.ANTHROPIC_AUTH_TOKEN
+  if (!authToken) {
+    // Check dedicated auth_token field first, then auto-detect from anthropic key
+    if (keys.anthropic_auth_token) {
+      authToken = keys.anthropic_auth_token
+    } else if (keys.anthropic && isSetupToken(keys.anthropic)) {
+      authToken = keys.anthropic
+    }
+  }
+
+  // 2. Check for API key (only if no auth token found)
+  let apiKey: string | undefined
+  if (!authToken) {
+    apiKey = process.env.ANTHROPIC_API_KEY
+    if (!apiKey && keys.anthropic && !isSetupToken(keys.anthropic)) {
+      apiKey = keys.anthropic
       process.env.ANTHROPIC_API_KEY = apiKey
     }
   }
 
-  if (!apiKey) {
+  if (!authToken && !apiKey) {
     throw new Error(
       [
-        'ANTHROPIC_API_KEY is not set.',
+        'No Anthropic credentials found.',
         '',
-        'Claude Paper requires an Anthropic API key to function.',
-        'Set it in one of these ways:',
+        'Set up authentication in one of these ways:',
         '',
-        '  1. Environment variable:',
+        '  1. API key (usage-based billing):',
         '     export ANTHROPIC_API_KEY="sk-ant-..."',
+        '     Get a key at: https://console.anthropic.com/settings/keys',
         '',
-        '  2. Run the setup wizard:',
-        '     /onboarding',
+        '  2. Setup token (subscription billing):',
+        '     export ANTHROPIC_AUTH_TOKEN="sk-ant-oat01-..."',
+        '     Run "claude setup-token" to generate one',
         '',
-        '  3. Run /settings api_keys.anthropic "sk-ant-..."',
-        '',
-        'Get a key at: https://console.anthropic.com/settings/keys',
+        '  3. Run the setup wizard: /onboarding',
       ].join('\n'),
     )
   }
 
-  const realClient = new Anthropic({ apiKey })
+  const realClient = authToken
+    ? new Anthropic({ authToken })
+    : new Anthropic({ apiKey: apiKey! })
 
   // Wrap messages.create to auto-track tokens
   const originalCreate = realClient.messages.create.bind(realClient.messages)
@@ -308,16 +385,97 @@ export function getOpenAIClient(): OpenAI {
   return cachedOpenAIClient
 }
 
+// ── OpenAI-Compatible Client Factory ─────────────────────
+
+const OPENAI_COMPAT_PROVIDERS: Record<
+  string,
+  { envKeys: string[]; baseURL: string; label: string; helpUrl: string }
+> = {
+  deepseek: {
+    envKeys: ['DEEPSEEK_API_KEY'],
+    baseURL: 'https://api.deepseek.com/v1',
+    label: 'DeepSeek',
+    helpUrl: 'https://platform.deepseek.com/api_keys',
+  },
+  qwen: {
+    envKeys: ['DASHSCOPE_API_KEY', 'QWEN_API_KEY'],
+    baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    label: 'Qwen (DashScope)',
+    helpUrl: 'https://dashscope.console.aliyun.com/apiKey',
+  },
+  glm: {
+    envKeys: ['ZHIPU_API_KEY', 'GLM_API_KEY'],
+    baseURL: 'https://open.bigmodel.cn/api/paas/v4',
+    label: 'GLM (Zhipu AI)',
+    helpUrl: 'https://open.bigmodel.cn/usercenter/apikeys',
+  },
+}
+
+const cachedCompatClients: Record<string, OpenAI> = {}
+
+/**
+ * Get an OpenAI-compatible client for DeepSeek, Qwen, or GLM providers.
+ */
+export function getOpenAICompatibleClient(provider: string): OpenAI {
+  if (cachedCompatClients[provider]) return cachedCompatClients[provider]
+
+  const info = OPENAI_COMPAT_PROVIDERS[provider]
+  if (!info) throw new Error(`Unknown OpenAI-compatible provider: ${provider}`)
+
+  let apiKey: string | undefined
+  for (const envKey of info.envKeys) {
+    apiKey = process.env[envKey]
+    if (apiKey) break
+  }
+
+  if (!apiKey) {
+    const keys = loadApiKeyFromConfig()
+    apiKey = (keys as any)[provider]
+    if (apiKey) {
+      process.env[info.envKeys[0]] = apiKey
+    }
+  }
+
+  if (!apiKey) {
+    throw new Error(
+      [
+        `${info.envKeys[0]} is not set.`,
+        '',
+        `Claude Paper requires a ${info.label} API key to use ${info.label} models.`,
+        'Set it in one of these ways:',
+        '',
+        '  1. Environment variable:',
+        `     export ${info.envKeys[0]}="your-key"`,
+        '',
+        '  2. Run the setup wizard:',
+        '     /onboarding',
+        '',
+        `Get a key at: ${info.helpUrl}`,
+      ].join('\n'),
+    )
+  }
+
+  const client = new OpenAI({
+    apiKey,
+    baseURL: info.baseURL,
+    timeout: 1_800_000,
+  })
+  cachedCompatClients[provider] = client
+  return client
+}
+
 // ── Provider Detection ──────────────────────────────────
 
 /**
  * Determine the provider from a "provider:model" spec string.
- * Returns 'anthropic' or 'openai'.
  */
-export function getProviderFromSpec(modelSpec: string): 'anthropic' | 'openai' {
+export function getProviderFromSpec(modelSpec: string): PaperProvider {
   const colonIdx = modelSpec.indexOf(':')
   if (colonIdx < 0) {
     // No provider prefix — infer from model name
+    if (modelSpec.startsWith('deepseek')) return 'deepseek'
+    if (modelSpec.startsWith('qwen')) return 'qwen'
+    if (modelSpec.startsWith('glm')) return 'glm'
     if (
       modelSpec.includes('gpt') ||
       modelSpec.includes('o3') ||
@@ -329,6 +487,9 @@ export function getProviderFromSpec(modelSpec: string): 'anthropic' | 'openai' {
   }
   const provider = modelSpec.slice(0, colonIdx).toLowerCase()
   if (provider === 'openai') return 'openai'
+  if (provider === 'deepseek') return 'deepseek'
+  if (provider === 'qwen') return 'qwen'
+  if (provider === 'glm') return 'glm'
   return 'anthropic'
 }
 
@@ -347,6 +508,7 @@ export interface UnifiedChatOptions {
   temperature?: number
   reasoning_effort?: 'low' | 'medium' | 'high' | 'max'
   tools?: any[] // Anthropic tool format
+  signal?: AbortSignal
 }
 
 export interface UnifiedChatResult {
@@ -401,14 +563,15 @@ export async function chatCompletion(
     }
   }
 
-  if (provider === 'openai') {
-    // GPT-5.4-pro (and similar) require the Responses API, not Chat Completions
-    if (needsResponsesAPI(modelId)) {
-      return chatCompletionOpenAIResponses(modelId, opts)
-    }
-    return chatCompletionOpenAI(modelId, opts)
+  if (provider === 'anthropic') {
+    return chatCompletionAnthropic(modelId, opts)
   }
-  return chatCompletionAnthropic(modelId, opts)
+  // OpenAI Responses API (gpt-5.4-pro only)
+  if (provider === 'openai' && needsResponsesAPI(modelId)) {
+    return chatCompletionOpenAIResponses(modelId, opts)
+  }
+  // All OpenAI-compatible providers (openai, deepseek, qwen, glm)
+  return chatCompletionOpenAICompat(provider, modelId, opts)
 }
 
 /**
@@ -471,7 +634,10 @@ async function chatCompletionAnthropic(
     params.max_tokens = (params.max_tokens ?? 16384) + thinkingBudget
   }
 
-  const response = await client.messages.create(params)
+  const response = await client.messages.create(
+    params,
+    opts.signal ? { signal: opts.signal } : undefined,
+  )
 
   const textBlocks = response.content.filter(
     (b): b is Anthropic.TextBlock => b.type === 'text',
@@ -503,11 +669,15 @@ async function chatCompletionAnthropic(
   }
 }
 
-async function chatCompletionOpenAI(
+async function chatCompletionOpenAICompat(
+  provider: PaperProvider,
   model: string,
   opts: UnifiedChatOptions,
 ): Promise<UnifiedChatResult> {
-  const client = getOpenAIClient()
+  const client =
+    provider === 'openai'
+      ? getOpenAIClient()
+      : getOpenAICompatibleClient(provider)
 
   // Build OpenAI messages
   const messages: OpenAI.ChatCompletionMessageParam[] = []
@@ -552,7 +722,10 @@ async function chatCompletionOpenAI(
   }
 
   const t0Chat = Date.now()
-  const response = await client.chat.completions.create(params)
+  const response = await client.chat.completions.create(
+    params,
+    opts.signal ? { signal: opts.signal } : undefined,
+  )
   const chatDuration = Date.now() - t0Chat
 
   const usage = response.usage
@@ -676,7 +849,7 @@ async function chatCompletionOpenAIResponses(
   const outputBudget = Math.max(Math.round(callerMax * effortMultiplier), 16384)
 
   const t0Resp = Date.now()
-  const response = await client.responses.create({
+  const respParams = {
     model,
     input: input as any,
     ...(systemParts.length > 0
@@ -689,7 +862,11 @@ async function chatCompletionOpenAIResponses(
       : {}),
     reasoning: { effort },
     store: false,
-  })
+  }
+  const response = await client.responses.create(
+    respParams,
+    opts.signal ? { signal: opts.signal } : undefined,
+  )
   const respDuration = Date.now() - t0Resp
 
   const usage = response.usage

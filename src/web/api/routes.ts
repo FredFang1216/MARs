@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs'
 import { join, resolve } from 'path'
 import { loadResearchState } from '../../paper/research-state'
 import { loadConfig, saveConfig, CONFIG_PATH } from '../../paper/config-io'
+import { invalidateCaches as invalidateLLMCaches } from '../../paper/llm-client'
 import { ExperimentLogManager } from '../../paper/experiments/experiment-log'
 import { loadSessionState } from '../../paper/session-state'
 import { listSessions } from '../../paper/session'
@@ -425,15 +426,15 @@ export async function handleApiRoute(req: Request, cwd: string): Promise<Respons
 
   if (path === '/api/config' && method === 'GET') {
     const config = loadConfig()
-    // Redact sensitive fields
+    // Redact sensitive fields — show only last 4 chars
     const safe = { ...config }
     if (safe.api_keys) {
       safe.api_keys = Object.fromEntries(
         Object.entries(safe.api_keys).map(([k, v]) => [
           k,
           typeof v === 'string' && v.length > 8
-            ? v.slice(0, 8) + '...'
-            : '***',
+            ? '***...' + v.slice(-4)
+            : v ? '***' : '',
         ]),
       )
     }
@@ -459,7 +460,32 @@ async function handleConfigUpdate(req: Request): Promise<Response> {
     if (!body || typeof body !== 'object') {
       return error('Invalid config body')
     }
-    saveConfig(body as Record<string, any>)
+    const existing = loadConfig()
+    // Merge api_keys: keep existing value if the incoming one looks redacted or too short
+    if (body.api_keys) {
+      const existingKeys = existing.api_keys ?? {}
+      for (const [k, v] of Object.entries(body.api_keys as Record<string, string>)) {
+        if (typeof v !== 'string' || v.includes('...') || v === '***' || v === '') {
+          // Looks redacted or empty — keep existing
+          (body as any).api_keys[k] = (existingKeys as any)[k]
+        } else if (v.length < 16) {
+          // Too short to be a valid API key — keep existing to prevent accidental corruption
+          (body as any).api_keys[k] = (existingKeys as any)[k]
+        }
+      }
+    }
+    // Deep merge known nested objects to prevent partial overwrites
+    const merged: Record<string, any> = { ...existing }
+    for (const [key, val] of Object.entries(body as Record<string, any>)) {
+      if (val && typeof val === 'object' && !Array.isArray(val) && existing[key] && typeof existing[key] === 'object') {
+        merged[key] = { ...existing[key], ...val }
+      } else {
+        merged[key] = val
+      }
+    }
+    saveConfig(merged)
+    // Invalidate cached LLM clients so new credentials take effect immediately
+    invalidateLLMCaches()
     return json({ success: true })
   } catch (e) {
     return error(`Failed to update config: ${e}`)

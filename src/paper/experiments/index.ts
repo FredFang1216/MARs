@@ -13,6 +13,9 @@ export type {
   CycleEntry,
   ClaimDelta,
   DashboardData,
+  ExperimentPlan,
+  DatasetSpec,
+  ExperimentSpec,
 } from './types'
 
 export { ExperimentEnvironment, slugify } from './environment'
@@ -23,3 +26,7 @@ export { ExperimentAuditor, collectPyFiles } from './auditor'
 export { ExperimentPromoter } from './promoter'
 export { ExperimentNotebook } from './notebook'
 export { ResearchJournal } from './journal'
+export { ExperimentPlanGenerator, summarizeExperimentPlan } from './plan-generator'
+export { DataPrefetcher } from './data-prefetch'
+export { PlanExecutor } from './plan-executor'
+export { ExperimentEvidenceConverter } from './evidence-converter'

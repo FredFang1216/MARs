@@ -35,7 +35,7 @@ export type CreationPhase =
 
 interface CreationStore {
   creationId: string | null
-  mode: 'auto' | 'stepwise' | null
+  mode: 'auto' | 'stepwise' | 'from_proposal' | null
   phase: CreationPhase
   progress: string[]
   proposals: Proposal[]
@@ -45,6 +45,7 @@ interface CreationStore {
 
   startAuto: (topic: string, options?: { budget_usd?: number; max_cycles?: number }) => Promise<void>
   startStepwise: (topic: string, options?: { budget_usd?: number; max_cycles?: number }) => Promise<void>
+  startFromProposal: (proposal: Proposal, options?: { budget_usd?: number; max_cycles?: number }) => Promise<void>
   selectProposal: (proposalId: string) => Promise<void>
   cancel: () => Promise<void>
   reset: () => void
@@ -97,6 +98,27 @@ export const useCreationStore = create<CreationStore>((set, get) => ({
     try {
       const result = await ws.request<{ creationId: string }>('creation/start-stepwise', {
         topic,
+        ...options,
+      })
+      set({ creationId: result.creationId })
+    } catch (e: any) {
+      set({ phase: 'error', error: e.message })
+    }
+  },
+
+  startFromProposal: async (proposal, options) => {
+    set({
+      phase: 'orchestrator_init',
+      mode: 'from_proposal',
+      progress: [],
+      proposals: [proposal],
+      selectedProposal: proposal,
+      error: null,
+      resultSessionId: null,
+    })
+    try {
+      const result = await ws.request<{ creationId: string }>('creation/start-from-proposal', {
+        proposal,
         ...options,
       })
       set({ creationId: result.creationId })

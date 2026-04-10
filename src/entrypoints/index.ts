@@ -23,6 +23,8 @@ if (hasFlag('--help-lite')) {
 
 if (hasFlag('--acp')) {
   await import('./acp.js')
+} else if (hasFlag('--web')) {
+  await import('./web.js')
 } else {
   await import('./cli.js')
 }

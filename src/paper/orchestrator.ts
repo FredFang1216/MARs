@@ -87,7 +87,11 @@ import type {
   ExperimentLogEntry,
   ClaimDelta as JournalClaimDelta,
   DashboardData,
+  ExperimentPlan,
 } from './experiments/types'
+import { summarizeExperimentPlan } from './experiments/plan-generator'
+import { PlanExecutor } from './experiments/plan-executor'
+import { ExperimentEvidenceConverter } from './experiments/evidence-converter'
 
 // ── Types ────────────────────────────────────────────────
 
@@ -176,6 +180,11 @@ export interface OrchestratorCallbacks {
     context: string,
   ) => Promise<ExecutionResult>
 
+  /** Execute multiple independent agents in parallel (optional; falls back to sequential) */
+  executeAgentsParallel?: (
+    agents: Array<{ agentName: string; task: string; context: string }>,
+  ) => Promise<ExecutionResult[]>
+
   /** Present a decision to the user for approval (interactive mode) */
   presentDecision: (
     decision: OrchestratorDecision,
@@ -203,6 +212,7 @@ export interface OrchestratorOptions {
   compute?: SystemCapabilities | null
   rigor_level?: 1 | 2 | 3
   research_stance?: ResearchStance
+  experiment_plan?: ExperimentPlan
 }
 
 const MAX_CONSECUTIVE_REDESIGNS = 3
@@ -299,6 +309,8 @@ export class Orchestrator {
   private createExperiment: CreateExperiment
   private experimentPromoter: ExperimentPromoter
   private researchStance: ResearchStance
+  private planExecutor: PlanExecutor | null = null
+  private evidenceConverter: ExperimentEvidenceConverter
   private lastCreatedExperimentId: string | null = null
   private lastCreatedExperimentDir: string | null = null
   private lastEffortLevels: {
@@ -362,6 +374,14 @@ export class Orchestrator {
     this.journal = new ResearchJournal(this.projectDir)
     this.createExperiment = new CreateExperiment(this.projectDir)
     this.experimentPromoter = new ExperimentPromoter(this.projectDir)
+
+    // Initialize plan executor if an experiment plan exists
+    if (state.experiment_plan) {
+      this.planExecutor = new PlanExecutor(this.projectDir, state.experiment_plan)
+    }
+
+    // Initialize experiment evidence converter
+    this.evidenceConverter = new ExperimentEvidenceConverter()
   }
 
   /**
@@ -378,6 +398,10 @@ export class Orchestrator {
       paper_type: options.paper_type,
       compute: options.compute,
     })
+    // Attach experiment plan if provided
+    if (options.experiment_plan) {
+      state.experiment_plan = options.experiment_plan
+    }
     return new Orchestrator(projectDir, state, callbacks, options)
   }
 
@@ -430,6 +454,24 @@ export class Orchestrator {
         this.callbacks.onProgress(
           `Cognitive state enriched: ${this.state.claimGraph.claims.length} claims, readiness: ${this.state.stability.paperReadiness}`,
         )
+      }
+
+      // Pre-fetch datasets from experiment plan
+      if (this.planExecutor) {
+        this.callbacks.onProgress('Pre-fetching experiment datasets...')
+        try {
+          const { downloaded, failed } = await this.planExecutor.prefetchData(
+            msg => this.callbacks.onProgress(`  [data] ${msg}`),
+          )
+          this.callbacks.onProgress(
+            `Data pre-fetch complete: ${downloaded} downloaded, ${failed} failed`,
+          )
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err)
+          this.callbacks.onProgress(
+            `Data pre-fetch failed: ${msg} — experiments will download data on demand`,
+          )
+        }
       }
     }
 
@@ -726,11 +768,38 @@ export class Orchestrator {
         }
 
         const execStartMs = Date.now()
-        const result = await this.callbacks.executeAgent(
-          decision.action.delegate_to,
-          decision.action.type,
-          enrichedContext,
-        )
+
+        // Check for independent tasks that can run in parallel with the primary agent.
+        // Only attempt if the callback is available and the primary agent is "heavy".
+        const parallelTasks = this.identifyParallelTasks(decision, graph)
+        let result: ExecutionResult
+        let parallelResults: ExecutionResult[] = []
+
+        if (
+          parallelTasks.length > 0 &&
+          this.callbacks.executeAgentsParallel
+        ) {
+          this.callbacks.onProgress(
+            `Running ${parallelTasks.length} bonus task(s) in parallel with ${decision.action.delegate_to}`,
+          )
+          const allAgents = [
+            {
+              agentName: decision.action.delegate_to,
+              task: decision.action.type,
+              context: enrichedContext,
+            },
+            ...parallelTasks,
+          ]
+          const allResults = await this.callbacks.executeAgentsParallel(allAgents)
+          result = allResults[0]
+          parallelResults = allResults.slice(1)
+        } else {
+          result = await this.callbacks.executeAgent(
+            decision.action.delegate_to,
+            decision.action.type,
+            enrichedContext,
+          )
+        }
 
         // Post-execution: run MathReasoningController for math proofs
         if (
@@ -741,12 +810,15 @@ export class Orchestrator {
           await this.runMathReasoningPostProcess(result, decision)
         }
 
-        // Record cost in BudgetTracker
-        if (result.cost_usd > 0) {
-          const agentCategory = result.success
-            ? this.agentToCategory(decision.action.delegate_to)
-            : 'failed'
-          this.budgetTracker.recordCost(result.cost_usd, agentCategory)
+        // Record cost in BudgetTracker (primary + parallel)
+        const allResultsForCost = [result, ...parallelResults]
+        for (const r of allResultsForCost) {
+          if (r.cost_usd > 0) {
+            const agentCategory = r.success
+              ? this.agentToCategory(r.agent)
+              : 'failed'
+            this.budgetTracker.recordCost(r.cost_usd, agentCategory)
+          }
         }
 
         // 10. Register evidence from agent output
@@ -783,6 +855,31 @@ export class Orchestrator {
           pool,
           targetClaimIds,
         )
+
+        // 10.2.5. Digest parallel results: register their evidence and claims
+        for (const pr of parallelResults) {
+          if (!pr.success) continue
+          const prEvidence = this.registerEvidence(pr, pool)
+          for (const c of pr.new_claims) {
+            if (c.statement) {
+              graph.addClaim({
+                type: c.type ?? 'hypothesis',
+                epistemicLayer: c.epistemicLayer ?? 'explanation',
+                statement: c.statement,
+                phase: 'proposed',
+                evidence: { grounded: [], derived: [] },
+                strength: {
+                  confidence: c.confidence ?? 0.5,
+                  evidenceType: c.evidenceType ?? 'heuristic_motivation',
+                  vulnerabilityScore: c.vulnerabilityScore ?? 0.5,
+                },
+                created_by: pr.agent,
+              })
+            }
+          }
+          // Link parallel evidence to claims broadly (no specific target)
+          this.linkEvidenceToClaims(prEvidence, graph, pool, [])
+        }
 
         // 10.3. Process experiment results: update log, extract metrics evidence
         if (decision.action.delegate_to === 'experiment-runner') {
@@ -841,17 +938,28 @@ export class Orchestrator {
         this.callbacks.onProgress('Digesting execution results...')
         this.state = await this.digest(result)
 
+        // 11.1 Digest parallel results
+        for (const pr of parallelResults) {
+          if (pr.success) {
+            this.state = await this.digest(pr)
+          }
+        }
+
         // 11.5. Harvest literature findings as grounded evidence
-        if (result.literature_findings?.known_results?.length) {
+        const allLitResults = [result, ...parallelResults.filter(r => r.success)]
+        const hasLiterature = allLitResults.some(
+          r => r.literature_findings?.known_results?.length,
+        )
+        if (hasLiterature) {
           const postDigestGraph = new ClaimGraph(this.state.claimGraph)
           const postDigestPool = new EvidencePoolManager(
             this.state.evidencePool,
           )
-          this.harvestLiteratureEvidence(
-            result,
-            postDigestGraph,
-            postDigestPool,
-          )
+          for (const r of allLitResults) {
+            if (r.literature_findings?.known_results?.length) {
+              this.harvestLiteratureEvidence(r, postDigestGraph, postDigestPool)
+            }
+          }
           this.state = {
             ...this.state,
             claimGraph: postDigestGraph.toJSON(),
@@ -2856,6 +2964,67 @@ Respond with ONLY valid JSON (no markdown fences):
       // experiment log may not exist yet
     }
 
+    // Inject experiment plan details for this specific experiment
+    if (this.state.experiment_plan) {
+      const plan = this.state.experiment_plan
+
+      // Try to find the matching planned experiment
+      const planned = this.planExecutor?.getNextExperiment()
+        ?? plan.experiments.find(
+          e =>
+            e.claim_target &&
+            targetsClaim &&
+            (e.claim_target.toLowerCase().includes(targetsClaim.toLowerCase()) ||
+              taskType.toLowerCase().includes(e.name.toLowerCase())),
+        )
+
+      if (planned && this.planExecutor) {
+        // Use PlanExecutor for rich context (includes dataset paths, download status, progress)
+        sections.push(this.planExecutor.buildExperimentContext(planned))
+
+        // Also provide the generated initial script as a starting point
+        sections.push(
+          '',
+          '## Initial Script (use as starting point, modify as needed)',
+          '```python',
+          this.planExecutor.generateInitialScript(planned),
+          '```',
+        )
+
+        // Mark as running
+        this.planExecutor.markExperiment(planned.id, 'running')
+      } else if (planned) {
+        // Fallback: inject plan details without PlanExecutor
+        sections.push(
+          '## Planned Experiment Design',
+          `ID: ${planned.id}`,
+          `Name: ${planned.name}`,
+          `Type: ${planned.type}`,
+          `Description: ${planned.description}`,
+          `Metrics: ${planned.metrics_to_collect.join(', ')}`,
+          `Success criteria: ${planned.success_criteria}`,
+          `Script outline:\n${planned.script_outline}`,
+          `Extra packages: ${planned.python_packages.join(', ') || 'none'}`,
+        )
+        const relatedDatasets = plan.datasets.filter(d =>
+          planned.datasets.includes(d.name),
+        )
+        if (relatedDatasets.length > 0) {
+          sections.push(
+            '',
+            '## Dataset Download Code',
+            ...relatedDatasets.map(
+              d =>
+                `### ${d.name} (${d.source}${d.source_id ? ':' + d.source_id : ''})\n${d.description}\n\`\`\`python\n${d.download_code}\n\`\`\``,
+            ),
+          )
+        }
+      } else {
+        // No match — provide full plan summary
+        sections.push('', summarizeExperimentPlan(plan))
+      }
+    }
+
     // Experiment conventions
     sections.push(
       '## Experiment Conventions',
@@ -2957,55 +3126,42 @@ Respond with ONLY valid JSON (no markdown fences):
         durationSeconds != null ? Math.round(durationSeconds) : null,
     })
 
-    // b) Read metrics.json
+    // a2) Update plan executor state if tracking this experiment
+    const matchedSpec = this.findMatchingPlanSpec(experimentId, decision.action.context)
+    if (this.planExecutor && matchedSpec) {
+      this.planExecutor.markExperiment(
+        matchedSpec.id,
+        result.success ? 'completed' : 'failed',
+      )
+      this.callbacks.onProgress(
+        `Plan: ${this.planExecutor.getProgressSummary()}`,
+      )
+    }
+
+    // b) Read metrics.json and convert to evidence via ExperimentEvidenceConverter
     const metrics = this.experimentResults.readMetrics(experimentId)
 
-    // c) Extract statistical test evidence and link to claims
-    if (metrics?.statistical_tests) {
+    if (metrics) {
       const graph = ClaimGraph.fromJSON(this.state.claimGraph)
-      const metricsEvidence: Array<{
-        id: string
-        kind: 'derived'
-        claimText: string
-      }> = []
+      const targetClaimId = decision.action.targets_claim || null
 
-      for (const [name, test] of Object.entries(metrics.statistical_tests)) {
-        if (
-          typeof test.statistic !== 'number' ||
-          typeof test.p_value !== 'number' ||
-          !Number.isFinite(test.statistic) ||
-          !Number.isFinite(test.p_value)
-        ) {
-          continue
-        }
-        const claimText = `${name}: statistic=${test.statistic.toFixed(4)}, p=${test.p_value.toFixed(4)}, significant@5%=${test.significant_5pct}`
-        const id = pool.addDerived({
-          claim: claimText,
-          method: 'experiment',
-          reproducible: true,
-          artifact_id: experimentId,
-          assumptions: [],
-          supports_claims: decision.action.targets_claim
-            ? [decision.action.targets_claim]
-            : [],
-          contradicts_claims: [],
-          produced_by: 'experiment-runner',
-        })
-        metricsEvidence.push({ id, kind: 'derived', claimText })
-      }
+      // Convert metrics → evidence + evaluate success criteria + update confidence
+      const conversion = this.evidenceConverter.convert(
+        metrics,
+        experimentId,
+        targetClaimId,
+        matchedSpec,
+        pool,
+        graph,
+      )
 
-      // Link metrics evidence to target claims on the ClaimGraph
-      if (metricsEvidence.length > 0) {
-        const targetClaimIds: string[] = []
-        if (decision.action.targets_claim)
-          targetClaimIds.push(decision.action.targets_claim)
-        if (decision.action.related_claims)
-          targetClaimIds.push(...decision.action.related_claims)
-        this.linkEvidenceToClaims(metricsEvidence, graph, pool, targetClaimIds)
-        this.state = {
-          ...this.state,
-          claimGraph: graph.toJSON(),
-        }
+      this.callbacks.onProgress(`Evidence: ${conversion.summary}`)
+
+      // Update state with modified graph + pool
+      this.state = {
+        ...this.state,
+        claimGraph: graph.toJSON(),
+        evidencePool: pool.pool,
       }
     }
   }
@@ -3062,6 +3218,24 @@ Respond with ONLY valid JSON (no markdown fences):
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-|-$/g, '') || 'experiment'
+    )
+  }
+
+  /**
+   * Find the ExperimentSpec from the plan that matches a given experiment ID.
+   */
+  private findMatchingPlanSpec(
+    experimentId: string,
+    actionContext?: string,
+  ): import('./experiments/types').ExperimentSpec | null {
+    if (!this.state.experiment_plan) return null
+    return (
+      this.state.experiment_plan.experiments.find(
+        spec =>
+          experimentId.includes(spec.id) ||
+          spec.id.includes(experimentId) ||
+          (actionContext?.includes(spec.id)),
+      ) ?? null
     )
   }
 
@@ -3304,6 +3478,75 @@ Respond with ONLY valid JSON (no markdown fences):
   }
 
   /** Map agent name to a BudgetCategory */
+  /**
+   * Identify independent "bonus" tasks that can safely run in parallel
+   * with the primary agent decision. Returns an empty array if no
+   * parallelizable work is found.
+   *
+   * Rules for parallel eligibility:
+   * 1. Only "read-mostly" agents (investigator, data-scout, fragment-writer)
+   *    are eligible as bonus tasks — never experiment-runner or math-reasoner.
+   * 2. A bonus task must target a DIFFERENT claim than the primary task.
+   * 3. The bonus task's estimated cost must fit within remaining budget.
+   * 4. Maximum 2 bonus tasks per cycle to limit cost.
+   */
+  private identifyParallelTasks(
+    primaryDecision: OrchestratorDecision,
+    graph: ClaimGraph,
+  ): Array<{ agentName: string; task: string; context: string }> {
+    // Only parallelize when the primary task is "heavy" (experiment/math/compilation)
+    const heavyAgents = ['experiment-runner', 'math-reasoner', 'latex-compiler', 'paper-assembler']
+    if (!heavyAgents.includes(primaryDecision.action.delegate_to)) {
+      return []
+    }
+
+    // Don't parallelize in interactive mode — user approved one action only
+    if (this.options.mode === 'interactive') {
+      return []
+    }
+
+    const primaryTargetClaim = primaryDecision.action.targets_claim
+    const primaryRelated = new Set(primaryDecision.action.related_claims ?? [])
+    if (primaryTargetClaim) primaryRelated.add(primaryTargetClaim)
+
+    const bonusTasks: Array<{ agentName: string; task: string; context: string }> = []
+    const MAX_BONUS = 2
+    let cumulativeEstCost = 0
+
+    // Look for proposed claims that need investigation (independent of primary target)
+    const unresolvedClaims = getUnresolvedClaims(this.state)
+    for (const claim of unresolvedClaims) {
+      if (bonusTasks.length >= MAX_BONUS) break
+      if (primaryRelated.has(claim.id)) continue // skip claims related to primary task
+      if (claim.phase !== 'proposed') continue
+
+      // Check budget for a lightweight investigation (~$0.05), accounting for
+      // already-planned bonus tasks to avoid over-committing.
+      const estCost = 0.05
+      if (this.budgetTracker.wouldExceedBudget(cumulativeEstCost + estCost)) break
+      cumulativeEstCost += estCost
+
+      // Use a unique notes prefix to avoid filesystem races with other parallel agents
+      const notePrefix = `parallel_${claim.id.slice(0, 8)}`
+      bonusTasks.push({
+        agentName: 'investigator',
+        task: `Investigate claim: "${claim.statement}"`,
+        context: this.buildSubAgentContext('investigator', {
+          type: `Investigate proposed claim`,
+          delegate_to: 'investigator',
+          context: `Focus on claim: "${claim.statement}" (${claim.type}, ${claim.epistemicLayer} layer). Search for supporting or contradicting evidence in literature.\n\nIMPORTANT: This is a parallel bonus task. Save notes to literature/notes/${notePrefix}_*.md to avoid file conflicts. Do NOT modify shared .bib files directly.`,
+          model_preference: 'default',
+          estimated_cost_usd: estCost,
+          priority: 'low',
+          if_this_fails: 'skip',
+          targets_claim: claim.id,
+        }),
+      })
+    }
+
+    return bonusTasks
+  }
+
   private agentToCategory(agentName: string): BudgetCategory {
     const map: Record<string, BudgetCategory> = {
       'experiment-runner': 'experiment',

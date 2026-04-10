@@ -17,6 +17,7 @@ import { TrajectoryCompressor } from '../trajectory-compressor'
 import { EvidencePoolCompressor } from '../evidence-pool-compressor'
 import type { DKPLoader } from '../domain-knowledge/loader'
 import type { ResearchStance } from '../types'
+import { summarizeExperimentPlan } from '../experiments/plan-generator'
 
 export class PromptAssembler {
   private graph: ClaimGraph
@@ -88,6 +89,7 @@ export class PromptAssembler {
         ),
         this.buildLiteratureContext(budget.literature),
         this.buildDomainKnowledgeContext(800),
+        this.buildExperimentPlanContext(),
         this.buildBudgetContext(),
       ]
         .filter(Boolean)
@@ -149,6 +151,7 @@ export class PromptAssembler {
         '## Skeptic Challenges\n' + this.summarizeSkeptic(skepticOutput, 1500),
         buildL0(this.graph, this.pool, this.state.stability),
         buildL2(this.graph, focusIds, this.pool, budget.l2FocusSubgraph),
+        this.buildExperimentPlanContext(),
         this.buildBudgetContext(),
         this.buildConvergenceContext(),
       ]
@@ -397,6 +400,12 @@ ${claimLines}`
     )
 
     return truncateToTokens(sections.join('\n'), budgetTokens)
+  }
+
+  private buildExperimentPlanContext(): string {
+    const plan = this.state.experiment_plan
+    if (!plan) return ''
+    return truncateToTokens(summarizeExperimentPlan(plan), 600)
   }
 
   private buildBudgetContext(): string {

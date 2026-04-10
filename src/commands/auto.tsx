@@ -4,10 +4,14 @@ import { Box, Text } from 'ink'
 // Launches the full AutoModeOrchestrator workflow
 // --dry-run: show plan without executing
 
+import { existsSync, readFileSync } from 'fs'
+import { resolve } from 'path'
 import type { Command } from '@commands'
 import { AutoModeOrchestrator } from '../paper/auto-mode'
 import { BudgetTracker } from '../paper/budget-tracker'
 import { getSessionDir } from '../paper/session'
+import type { Proposal } from '../paper/proposal/types'
+import { validateAndNormalizeProposal } from '../paper/proposal/types'
 
 const STAGES = [
   {
@@ -54,6 +58,7 @@ function parseArgs(args: string): {
   depth?: 'quick' | 'standard' | 'thorough'
   dryRun: boolean
   exploratory: boolean
+  proposalPath?: string
 } {
   // Extract topic: everything before the first --flag
   const firstFlagIdx = args.indexOf(' --')
@@ -76,7 +81,13 @@ function parseArgs(args: string): {
   const dryRun = /--dry-run/.test(args)
   const exploratory = /--exploratory/.test(args)
 
-  return { topic, budget, depth, dryRun, exploratory }
+  let proposalPath: string | undefined
+  const proposalMatch = args.match(/--proposal\s+(?:"([^"]+)"|'([^']+)'|(\S+))/)
+  if (proposalMatch) {
+    proposalPath = proposalMatch[1] ?? proposalMatch[2] ?? proposalMatch[3]
+  }
+
+  return { topic, budget, depth, dryRun, exploratory, proposalPath }
 }
 
 function formatDryRun(topic: string, budget?: number, depth?: string): string {
@@ -208,6 +219,107 @@ function AutoProgressUI({
   )
 }
 
+/** Load and validate a Proposal JSON file. Returns the proposal or an error string. */
+function loadProposalFile(filePath: string): Proposal | string {
+  const resolved = resolve(filePath)
+  if (!existsSync(resolved)) {
+    return `Proposal file not found: ${resolved}`
+  }
+  try {
+    const raw = readFileSync(resolved, 'utf-8')
+    const parsed = JSON.parse(raw)
+    const result = validateAndNormalizeProposal(parsed)
+    if ('error' in result) return result.error
+    return result.proposal
+  } catch (err) {
+    return `Failed to parse proposal JSON: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
+function FromProposalProgressUI({
+  proposal,
+  budget,
+  exploratory,
+  onDone,
+}: {
+  proposal: Proposal
+  budget: number | undefined
+  exploratory: boolean
+  onDone: (result: string) => void
+}): React.ReactNode {
+  const [frame, setFrame] = useState(0)
+  const [elapsed, setElapsed] = useState(0)
+  const [startTime] = useState(Date.now())
+  const [logs, setLogs] = useState<string[]>([])
+  const [stage, setStage] = useState('Starting from proposal...')
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      setFrame(f => (f + 1) % SPINNER.length)
+      setElapsed(Math.floor((Date.now() - startTime) / 1000))
+    }, 80)
+    return () => clearInterval(t)
+  }, [])
+
+  useEffect(() => {
+    const projectDir = getSessionDir()
+    const budgetTracker = new BudgetTracker({ limitUSD: budget })
+    const allLogs: string[] = []
+
+    const orchestrator = new AutoModeOrchestrator(projectDir)
+
+    orchestrator
+      .runFromProposal(
+        proposal,
+        (msg: string) => {
+          allLogs.push(msg)
+          setLogs(prev => [...prev, msg])
+          if (msg.startsWith('===')) setStage(msg.replace(/=/g, '').trim())
+        },
+        {
+          budget_usd: budget,
+          research_stance: exploratory ? 'exploratory' : 'standard',
+        },
+      )
+      .then(result => {
+        onDone(formatResult(result, allLogs, budgetTracker))
+      })
+      .catch(err => {
+        const message = err instanceof Error ? err.message : String(err)
+        onDone(
+          [
+            `Auto mode failed: ${message}`,
+            '',
+            ...allLogs.map(l => `  ${l}`),
+            budgetTracker.formatSummary(),
+          ].join('\n'),
+        )
+      })
+  }, [])
+
+  const mins = Math.floor(elapsed / 60)
+  const secs = elapsed % 60
+  const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`
+
+  return (
+    <Box flexDirection="column" paddingLeft={1}>
+      <Box>
+        <Text color="cyan">{SPINNER[frame]} </Text>
+        <Text bold>From Proposal: </Text>
+        <Text>{stage}</Text>
+        <Text dimColor> ({timeStr})</Text>
+      </Box>
+      <Box flexDirection="column" marginTop={1}>
+        {logs.slice(-6).map((l, i) => (
+          <Box key={i}>
+            <Text dimColor> {l}</Text>
+          </Box>
+        ))}
+      </Box>
+    </Box>
+  )
+}
+
 const auto: Command = {
   type: 'local-jsx',
   name: 'auto',
@@ -219,7 +331,7 @@ const auto: Command = {
   isEnabled: true,
   isHidden: false,
   argumentHint:
-    '<topic> [--budget $50] [--depth quick|standard|thorough] [--exploratory] [--dry-run]',
+    '<topic> [--budget $50] [--depth quick|standard|thorough] [--exploratory] [--proposal path.json] [--dry-run]',
   aliases: [],
 
   async call(
@@ -231,21 +343,39 @@ const auto: Command = {
     if (!argsStr.trim()) {
       onDone(
         [
-          'Usage: /auto <topic> [--budget $50] [--depth quick|standard|thorough] [--exploratory] [--dry-run]',
+          'Usage: /auto <topic> [--budget $50] [--depth quick|standard|thorough] [--exploratory] [--proposal path.json] [--dry-run]',
           '',
           'Example:',
-          '  /auto "rough volatility estimation with high-frequency data"',
+          '  /auto "rough volatility estimation" --budget 30',
           '  /auto "transformer attention" --depth thorough --budget 30',
-          '  /auto "neural scaling laws" --exploratory --budget 20',
+          '  /auto --proposal my-proposal.json --budget 20',
+          '  /auto --proposal my-proposal.json --exploratory',
         ].join('\n'),
       )
       return null
     }
 
-    const { topic, budget, depth, dryRun, exploratory } = parseArgs(argsStr)
+    const { topic, budget, depth, dryRun, exploratory, proposalPath } = parseArgs(argsStr)
+
+    // --proposal mode: load proposal file and skip research + proposal generation
+    if (proposalPath) {
+      const result = loadProposalFile(proposalPath)
+      if (typeof result === 'string') {
+        onDone(`Error: ${result}`)
+        return null
+      }
+      return (
+        <FromProposalProgressUI
+          proposal={result}
+          budget={budget}
+          exploratory={exploratory}
+          onDone={r => onDone(r)}
+        />
+      )
+    }
 
     if (!topic) {
-      onDone('Error: Could not parse topic.')
+      onDone('Error: Could not parse topic. Provide a topic or use --proposal <path.json>.')
       return null
     }
 

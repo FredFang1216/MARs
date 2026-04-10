@@ -5,6 +5,36 @@ import { useWsStore } from '../stores/wsStore'
 import CreationProgress from '../components/creation/CreationProgress'
 import ProposalCard from '../components/creation/ProposalCard'
 
+const MAX_PROPOSAL_JSON_SIZE = 100_000
+
+/** Validate proposal JSON string. Uses the same rules as backend. */
+function validateProposalJson(text: string): { proposal: any; error: null } | { proposal: null; error: string } {
+  if (text.length > MAX_PROPOSAL_JSON_SIZE) {
+    return { proposal: null, error: `Proposal JSON too large (max ${MAX_PROPOSAL_JSON_SIZE} bytes)` }
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return { proposal: null, error: 'Invalid JSON' }
+  }
+
+  // Validate required fields (mirrors validateAndNormalizeProposal on backend)
+  if (!parsed || typeof parsed !== 'object') return { proposal: null, error: 'Must be an object' }
+  const p = parsed as Record<string, unknown>
+  if (!p.title || typeof p.title !== 'string') return { proposal: null, error: 'Missing "title" (string)' }
+  if (!p.abstract || typeof p.abstract !== 'string') return { proposal: null, error: 'Missing "abstract" (string)' }
+  if (!p.methodology || typeof p.methodology !== 'string') return { proposal: null, error: 'Missing "methodology" (string)' }
+  if (!Array.isArray(p.innovation) || p.innovation.length === 0 || !p.innovation.every((i: unknown) => typeof i === 'string')) {
+    return { proposal: null, error: '"innovation" must be a non-empty array of strings' }
+  }
+  if (!p.feasibility || typeof p.feasibility !== 'object') return { proposal: null, error: 'Missing "feasibility" object' }
+  if (!p.risk || typeof p.risk !== 'object') return { proposal: null, error: 'Missing "risk" object' }
+
+  // Backend will do full normalization + defaults — just pass validated object
+  return { proposal: parsed, error: null }
+}
+
 export default function NewResearch() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
@@ -12,10 +42,12 @@ export default function NewResearch() {
   const connected = useWsStore(s => s.connected)
 
   const [topic, setTopic] = useState(searchParams.get('topic') ?? '')
-  const [mode, setMode] = useState<'auto' | 'stepwise'>('auto')
+  const [mode, setMode] = useState<'auto' | 'stepwise' | 'import'>('auto')
   const [budgetUsd, setBudgetUsd] = useState('')
   const [maxCycles, setMaxCycles] = useState('')
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null)
+  const [proposalJson, setProposalJson] = useState('')
+  const [proposalError, setProposalError] = useState<string | null>(null)
 
   // Subscribe to creation WS notifications
   useEffect(() => {
@@ -44,7 +76,15 @@ export default function NewResearch() {
       if (Number.isInteger(parsed) && parsed > 0) opts.max_cycles = parsed
     }
 
-    if (mode === 'auto') {
+    if (mode === 'import') {
+      const result = validateProposalJson(proposalJson)
+      if (result.error) {
+        setProposalError(result.error)
+        return
+      }
+      setProposalError(null)
+      store.startFromProposal(result.proposal, opts)
+    } else if (mode === 'auto') {
       store.startAuto(topic, opts)
     } else {
       store.startStepwise(topic, opts)
@@ -69,18 +109,6 @@ export default function NewResearch() {
         )}
 
         <div className="space-y-4">
-          {/* Topic */}
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Research Topic</label>
-            <textarea
-              value={topic}
-              onChange={e => setTopic(e.target.value)}
-              placeholder="e.g., Optimal Transport for Generative Flow Matching"
-              rows={3}
-              className="w-full bg-surface-1 border border-gray-700 rounded-lg px-4 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-accent-cyan/50"
-            />
-          </div>
-
           {/* Mode */}
           <div>
             <label className="block text-sm text-gray-400 mb-1">Mode</label>
@@ -111,8 +139,49 @@ export default function NewResearch() {
                   Review & pick proposals
                 </span>
               </button>
+              <button
+                onClick={() => setMode('import')}
+                className={`flex-1 px-4 py-2 rounded text-sm border transition-colors ${
+                  mode === 'import'
+                    ? 'bg-accent-cyan/20 text-accent-cyan border-accent-cyan/50'
+                    : 'bg-surface-1 text-gray-400 border-gray-700 hover:border-gray-600'
+                }`}
+              >
+                Import Proposal
+                <span className="block text-xs mt-0.5 opacity-70">
+                  Start from your own proposal
+                </span>
+              </button>
             </div>
           </div>
+
+          {/* Topic (for auto/stepwise) or Proposal JSON (for import) */}
+          {mode !== 'import' ? (
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Research Topic</label>
+              <textarea
+                value={topic}
+                onChange={e => setTopic(e.target.value)}
+                placeholder="e.g., Optimal Transport for Generative Flow Matching"
+                rows={3}
+                className="w-full bg-surface-1 border border-gray-700 rounded-lg px-4 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-accent-cyan/50"
+              />
+            </div>
+          ) : (
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Proposal JSON</label>
+              <textarea
+                value={proposalJson}
+                onChange={e => { setProposalJson(e.target.value); setProposalError(null) }}
+                placeholder={'Paste your proposal JSON here. Required fields:\n{\n  "title": "...",\n  "abstract": "...",\n  "methodology": "...",\n  "innovation": ["..."],\n  "feasibility": { "data_required": "...", "compute_estimate": "..." },\n  "risk": { "level": "low|medium|high", "description": "..." }\n}'}
+                rows={10}
+                className="w-full bg-surface-1 border border-gray-700 rounded-lg px-4 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-accent-cyan/50 font-mono text-xs"
+              />
+              {proposalError && (
+                <p className="text-red-400 text-xs mt-1">{proposalError}</p>
+              )}
+            </div>
+          )}
 
           {/* Options */}
           <div className="grid grid-cols-2 gap-4">
@@ -149,10 +218,17 @@ export default function NewResearch() {
           {/* Start button */}
           <button
             onClick={handleStart}
-            disabled={!topic.trim() || !connected}
+            disabled={
+              !connected ||
+              (mode === 'import' ? !proposalJson.trim() : !topic.trim())
+            }
             className="w-full px-4 py-2.5 bg-accent-cyan/20 text-accent-cyan rounded-lg text-sm font-medium hover:bg-accent-cyan/30 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {connected ? 'Start Research' : 'Waiting for connection...'}
+            {!connected
+              ? 'Waiting for connection...'
+              : mode === 'import'
+                ? 'Start from Proposal'
+                : 'Start Research'}
           </button>
         </div>
       </div>

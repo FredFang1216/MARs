@@ -12,6 +12,7 @@ import {
   type ResearchState,
 } from './research-state'
 import type { Proposal } from './proposal/types'
+import { ExperimentPlanGenerator } from './experiments/plan-generator'
 
 import { DEFAULT_MODEL_ASSIGNMENTS } from './types'
 import { extractModelId } from './agent-dispatch'
@@ -58,6 +59,32 @@ export class AutoModeOrchestrator {
   ): Promise<{ status: string; artifacts: string[] }> {
     // Redirect to adaptive mode — the old pipeline is removed per v3 spec
     return this.runAdaptive(topic, onLog)
+  }
+
+  /**
+   * Start research directly from a pre-written Proposal, skipping
+   * deep research (Phase 1) and proposal generation (Phase 2).
+   * Goes straight to: system probe → experiment plan → orchestrator launch.
+   */
+  async runFromProposal(
+    proposal: Proposal,
+    onLog: (msg: string) => void,
+    options?: {
+      budget_usd?: number
+      max_cycles?: number
+      research_stance?: 'exploratory' | 'standard'
+    },
+  ): Promise<{ status: string; artifacts: string[]; state?: ResearchState }> {
+    mkdirSync(this.projectDir, { recursive: true })
+
+    const emit = (msg: string) => {
+      onLog(msg)
+      log(this.logPath, msg)
+    }
+
+    emit(`=== Starting from imported proposal: "${proposal.title}" ===`)
+
+    return this.launchOrchestrator(proposal, emit, [], options)
   }
 
   /**
@@ -134,6 +161,23 @@ export class AutoModeOrchestrator {
       return { status: 'proposal_generation_failed', artifacts }
     }
 
+    return this.launchOrchestrator(selectedProposal, emit, artifacts, options)
+  }
+
+  /**
+   * Shared phases 3–4: system probe → experiment plan → orchestrator launch.
+   * Used by both runAdaptive() and runFromProposal().
+   */
+  private async launchOrchestrator(
+    proposal: Proposal,
+    emit: (msg: string) => void,
+    artifacts: string[],
+    options?: {
+      budget_usd?: number
+      max_cycles?: number
+      research_stance?: 'exploratory' | 'standard'
+    },
+  ): Promise<{ status: string; artifacts: string[]; state?: ResearchState }> {
     // Phase 3: Probe system capabilities
     let systemCaps = null
     try {
@@ -142,8 +186,33 @@ export class AutoModeOrchestrator {
       emit('System probe failed, proceeding with defaults')
     }
 
+    // Phase 3.5: Generate Experiment Plan from Proposal
+    emit('=== Phase 3.5: Designing Experiment Plan ===')
+    let experimentPlan = ExperimentPlanGenerator.load(this.projectDir)
+    if (!experimentPlan) {
+      try {
+        const planGen = new ExperimentPlanGenerator()
+        experimentPlan = await planGen.generate(proposal, {
+          compute: systemCaps,
+          projectDir: this.projectDir,
+        })
+        emit(
+          `Experiment plan generated: ${experimentPlan.experiments.length} experiments, ${experimentPlan.datasets.length} datasets`,
+        )
+        emit(`Execution order: ${experimentPlan.execution_order.join(' → ')}`)
+        emit(
+          `Compute estimate: ${experimentPlan.total_compute_estimate} | GPU: ${experimentPlan.requires_gpu ? 'required' : 'not required'}`,
+        )
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
+        emit(`Experiment plan generation failed: ${msg} — orchestrator will design experiments on the fly`)
+      }
+    } else {
+      emit(`Loaded existing experiment plan: ${experimentPlan.experiments.length} experiments`)
+    }
+
     // Phase 4: Initialize ResearchState + Launch Orchestrator
-    emit('=== Phase 3: Launching Orchestrator ===')
+    emit('=== Phase 4: Launching Orchestrator ===')
 
     const callbacks: OrchestratorCallbacks = {
       executeAgent: async (agentName, task, context) => {
@@ -181,7 +250,7 @@ export class AutoModeOrchestrator {
 
     const orchestrator = Orchestrator.fromProposal(
       this.projectDir,
-      selectedProposal,
+      proposal,
       callbacks,
       {
         mode: 'auto',
@@ -189,12 +258,13 @@ export class AutoModeOrchestrator {
         max_cycles: options?.max_cycles ?? 50,
         compute: systemCaps,
         research_stance: options?.research_stance,
+        experiment_plan: experimentPlan ?? undefined,
       },
     )
 
     try {
       const finalState = await orchestrator.run()
-      emit('=== Adaptive Auto Mode Complete ===')
+      emit('=== Auto Mode Complete ===')
       emit(buildStateContext(finalState))
       return { status: 'completed', artifacts, state: finalState }
     } catch (err: unknown) {

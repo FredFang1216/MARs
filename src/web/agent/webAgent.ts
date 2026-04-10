@@ -19,6 +19,7 @@ import { DKPLoader } from '../../paper/domain-knowledge/loader'
 import { OrchestratorManager } from '../orchestrator/manager'
 import { CreationManager } from '../creation/manager'
 import { ChatManager } from '../chat/manager'
+import { validateAndNormalizeProposal } from '../../paper/proposal/types'
 
 export interface WebAgentOptions {
   cwd: string
@@ -333,6 +334,31 @@ export class WebAgent {
         const { creationId } = params as { creationId: string }
         if (!creationId) throw new JsonRpcError(-32602, 'creationId is required')
         return this.creationManager.getStatus(creationId)
+      },
+    )
+
+    this.peer.registerMethod(
+      'creation/start-from-proposal',
+      async (params: unknown) => {
+        const { proposal: rawProposal, budget_usd, max_cycles } = params as {
+          proposal: unknown
+          budget_usd?: number
+          max_cycles?: number
+        }
+
+        const validated = validateAndNormalizeProposal(rawProposal)
+        if ('error' in validated) {
+          throw new JsonRpcError(-32602, `Invalid proposal: ${validated.error}`)
+        }
+        const proposal = validated.proposal
+
+        const creationId = await this.creationManager.startFromProposal(
+          proposal,
+          this.cwd,
+          this.peer,
+          { budget_usd, max_cycles },
+        )
+        return { creationId }
       },
     )
 

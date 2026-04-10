@@ -184,3 +184,41 @@ export interface DashboardData {
   turning_points: number
   last_updated: string
 }
+
+// -- Experiment Plan (proposal → experiment design) -----
+
+export interface DatasetSpec {
+  name: string
+  source: 'openml' | 'sklearn' | 'huggingface' | 'url' | 'generate' | 'api'
+  source_id?: string       // OpenML data_id, sklearn dataset name, HF dataset path, etc.
+  download_code: string    // Python snippet to download/load this dataset
+  size_estimate: string    // e.g. "~10K rows, 20 features"
+  description: string
+}
+
+export interface ExperimentSpec {
+  id: string
+  name: string
+  claim_target: string        // Which proposal claim this validates
+  description: string         // What this experiment tests
+  type: 'probe' | 'full'     // Tier 1 or Tier 2
+  datasets: string[]          // References to DatasetSpec.name
+  script_outline: string      // High-level pseudocode / approach
+  metrics_to_collect: string[] // e.g. ["accuracy", "f1", "training_time_sec"]
+  success_criteria: string    // e.g. "accuracy > baseline by 2% on majority of datasets"
+  dependencies: string[]      // Other ExperimentSpec.id this depends on
+  estimated_duration: string  // e.g. "5 minutes"
+  python_packages: string[]   // Extra pip packages needed beyond defaults
+}
+
+export interface ExperimentPlan {
+  id: string
+  proposal_id: string
+  created_at: string
+  datasets: DatasetSpec[]
+  experiments: ExperimentSpec[]
+  execution_order: string[]       // Topologically sorted experiment IDs
+  total_compute_estimate: string
+  requires_gpu: boolean
+  data_acquisition_strategy: string  // Human-readable summary of how to get all data
+}

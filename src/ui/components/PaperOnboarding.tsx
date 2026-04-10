@@ -1,9 +1,10 @@
-import React, { useState } from 'react'
+import React, { useState, useRef } from 'react'
 import { Box, Newline, Text, useInput } from 'ink'
 import TextInput from 'ink-text-input'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import os from 'os'
 import { PAPER_ASCII_LOGO } from '@constants/product'
+import modelCatalog from '@constants/models'
 
 type Props = { onDone(): void }
 
@@ -32,12 +33,11 @@ interface AdvancedModelConfig {
   base_url?: string
   max_output_tokens?: number
   thinking_effort?: 'low' | 'medium' | 'high' | 'max'
-  context_window?: number
   temperature?: number
 }
 
 interface WizardConfig {
-  api_keys: { anthropic: string; openai: string; semantic_scholar: string }
+  api_keys: { anthropic: string; anthropic_auth_token: string; openai: string; deepseek: string; qwen: string; glm: string; semantic_scholar: string }
   models: Record<string, string>
   advanced_models?: Record<string, AdvancedModelConfig>
   paper: { template: string; language: string }
@@ -60,6 +60,21 @@ interface WizardConfig {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+const ANTHROPIC_SETUP_TOKEN_PREFIX = 'sk-ant-oat01-'
+
+/** Route anthropic input to the correct api_keys fields based on prefix detection */
+function routeAnthropicKey(value: string): { anthropic: string; anthropic_auth_token: string } {
+  if (value.startsWith(ANTHROPIC_SETUP_TOKEN_PREFIX)) {
+    return { anthropic: '', anthropic_auth_token: value }
+  }
+  return { anthropic: value, anthropic_auth_token: '' }
+}
+
+/** Resolve the effective anthropic credential from input + env */
+function resolveAnthropicInput(input: string): string {
+  return input || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || ''
+}
+
 const CONFIG_DIR = `${os.homedir()}/.claude-paper`
 const CONFIG_PATH = `${CONFIG_DIR}/config.json`
 const ACCESS_PATH = `${CONFIG_DIR}/access.json`
@@ -72,7 +87,7 @@ const LANGUAGES = ['english', 'chinese']
 
 function defaultConfig(): WizardConfig {
   return {
-    api_keys: { anthropic: '', openai: '', semantic_scholar: '' },
+    api_keys: { anthropic: '', anthropic_auth_token: '', openai: '', deepseek: '', qwen: '', glm: '', semantic_scholar: '' },
     models: {
       research: 'anthropic:claude-opus-4-6',
       reasoning: 'openai:gpt-5.4',
@@ -118,10 +133,19 @@ async function saveWizardConfig(cfg: WizardConfig): Promise<void> {
   // Save access config separately to ~/.claude-paper/access.json
   writeFileSync(ACCESS_PATH, JSON.stringify(access, null, 2) + '\n', 'utf-8')
 
-  // Set env vars for current session
-  if (cfg.api_keys.anthropic)
+  // Set env vars for current session — clear opposing var to prevent stale precedence
+  if (cfg.api_keys.anthropic_auth_token) {
+    process.env.ANTHROPIC_AUTH_TOKEN = cfg.api_keys.anthropic_auth_token
+    delete process.env.ANTHROPIC_API_KEY
+  } else if (cfg.api_keys.anthropic) {
     process.env.ANTHROPIC_API_KEY = cfg.api_keys.anthropic
+    delete process.env.ANTHROPIC_AUTH_TOKEN
+  }
   if (cfg.api_keys.openai) process.env.OPENAI_API_KEY = cfg.api_keys.openai
+  if (cfg.api_keys.deepseek)
+    process.env.DEEPSEEK_API_KEY = cfg.api_keys.deepseek
+  if (cfg.api_keys.qwen) process.env.DASHSCOPE_API_KEY = cfg.api_keys.qwen
+  if (cfg.api_keys.glm) process.env.ZHIPU_API_KEY = cfg.api_keys.glm
   if (cfg.api_keys.semantic_scholar)
     process.env.S2_API_KEY = cfg.api_keys.semantic_scholar
 
@@ -131,7 +155,7 @@ async function saveWizardConfig(cfg: WizardConfig): Promise<void> {
     const globalConfig = getGlobalConfig()
 
     const anthropicKey =
-      cfg.api_keys.anthropic || process.env.ANTHROPIC_API_KEY || ''
+      cfg.api_keys.anthropic_auth_token || cfg.api_keys.anthropic || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || ''
     if (anthropicKey) {
       const modelName = 'claude-sonnet-4-6'
       const profileName = 'Claude Sonnet 4.6'
@@ -247,6 +271,113 @@ async function probeCompute(): Promise<ComputeInfo> {
   }
 }
 
+// ── Advanced Mode: Model Selection Helpers ──────────────────────
+
+interface FlatModelEntry {
+  type: 'provider-header' | 'model'
+  provider: string
+  displayName?: string
+  model?: string
+  modelSpec?: string
+  supports_reasoning_effort?: boolean
+  max_output_tokens?: number
+  max_input_tokens?: number
+}
+
+const PROVIDER_INFO: Record<string, { label: string; modelsUrl?: string }> = {
+  anthropic: { label: 'Anthropic' },
+  openai:    { label: 'OpenAI',   modelsUrl: 'https://api.openai.com/v1/models' },
+  deepseek:  { label: 'DeepSeek', modelsUrl: 'https://api.deepseek.com/v1/models' },
+  qwen:      { label: 'Qwen',    modelsUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1/models' },
+  glm:       { label: 'GLM',     modelsUrl: 'https://open.bigmodel.cn/api/paas/v4/models' },
+}
+
+const SUPPORTED_PROVIDERS = ['anthropic', 'openai', 'deepseek', 'qwen', 'glm'] as const
+
+function buildFlatModelList(
+  cfg: WizardConfig,
+  dynamicModels: Record<string, string[]>,
+): FlatModelEntry[] {
+  const providerHasKey: Record<string, boolean> = {
+    anthropic: !!(cfg.api_keys.anthropic || cfg.api_keys.anthropic_auth_token || process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+    openai: !!(cfg.api_keys.openai || process.env.OPENAI_API_KEY),
+    deepseek: !!(cfg.api_keys.deepseek || process.env.DEEPSEEK_API_KEY),
+    qwen: !!(cfg.api_keys.qwen || process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY),
+    glm: !!(cfg.api_keys.glm || process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY),
+  }
+  const entries: FlatModelEntry[] = []
+  for (const p of SUPPORTED_PROVIDERS) {
+    if (!providerHasKey[p]) continue
+    const staticModels = (modelCatalog as Record<string, any[]>)[p] ?? []
+    const staticIds = new Set(staticModels.map((m: any) => m.model))
+    const dynamicOnly = (dynamicModels[p] ?? []).filter((id: string) => !staticIds.has(id))
+    if (staticModels.length === 0 && dynamicOnly.length === 0) continue
+    entries.push({ type: 'provider-header', provider: p, displayName: PROVIDER_INFO[p]?.label ?? p })
+    for (const m of staticModels) {
+      entries.push({
+        type: 'model', provider: p, model: m.model,
+        modelSpec: `${p}:${m.model}`,
+        supports_reasoning_effort: !!m.supports_reasoning_effort,
+        max_output_tokens: m.max_output_tokens,
+        max_input_tokens: m.max_input_tokens,
+      })
+    }
+    for (const id of dynamicOnly) {
+      entries.push({ type: 'model', provider: p, model: id, modelSpec: `${p}:${id}` })
+    }
+  }
+  return entries
+}
+
+async function fetchProviderModels(provider: string, apiKey: string): Promise<string[]> {
+  const info = PROVIDER_INFO[provider]
+  if (!info?.modelsUrl || !apiKey) return []
+  try {
+    const res = await fetch(info.modelsUrl, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) return []
+    const json = await res.json()
+    return (json.data ?? []).map((m: any) => m.id).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function nextModelIdx(list: FlatModelEntry[], current: number, dir: 1 | -1): number {
+  let idx = current + dir
+  while (idx >= 0 && idx < list.length) {
+    if (list[idx].type === 'model') return idx
+    idx += dir
+  }
+  return current
+}
+
+function fmtCtx(n?: number): string {
+  if (n == null || n <= 0) return ''
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(0)}M ctx`
+  return `${Math.round(n / 1000)}K ctx`
+}
+
+function getParamFields(role: string, cfg: WizardConfig, flatList: FlatModelEntry[]): Array<{ label: string; key: string; value: string }> {
+  const modelSpec = cfg.models[role]
+  const entry = flatList.find(e => e.modelSpec === modelSpec)
+  const adv = cfg.advanced_models?.[role] ?? {}
+  const fields: Array<{ label: string; key: string; value: string }> = [
+    { label: 'Max Output Tokens', key: 'max_output_tokens', value: adv.max_output_tokens != null ? String(adv.max_output_tokens) : `(default: ${entry?.max_output_tokens ?? 8192})` },
+    { label: 'Temperature', key: 'temperature', value: adv.temperature != null ? String(adv.temperature) : '(default)' },
+  ]
+  if (entry?.supports_reasoning_effort) {
+    fields.push({ label: 'Thinking Effort', key: 'thinking_effort', value: adv.thinking_effort ?? '(default)' })
+  }
+  fields.push(
+    { label: 'Base URL Override', key: 'base_url', value: adv.base_url || '(default)' },
+    { label: 'API Key Override', key: 'api_key', value: adv.api_key ? '****' + adv.api_key.slice(-4) : '(default)' },
+  )
+  return fields
+}
+
 // ── Step 0: Welcome ──────────────────────────────────────────────
 
 function WelcomeStep(): React.ReactNode {
@@ -272,99 +403,156 @@ const MODEL_ROLES = [
   { key: 'quick', icon: '⚡', label: 'Quick' },
 ]
 
+type ApiKeyField = 'anthropic' | 'openai' | 'deepseek' | 'qwen' | 'glm' | 'none'
+
 function ModelConfigStep({
   cfg,
   apiKey,
   onApiKeyChange,
   openaiKey,
   onOpenaiKeyChange,
+  deepseekKey,
+  onDeepseekKeyChange,
+  qwenKey,
+  onQwenKeyChange,
+  glmKey,
+  onGlmKeyChange,
   activeField,
   advancedMode,
-  advancedCursor,
+  advancedSubScreen,
   advancedRole,
-  advancedEditing,
-  advancedValue,
-  onAdvancedValueChange,
+  flatModelList,
+  modelListCursor,
+  paramCursor,
+  paramEditing,
+  paramValue,
+  onParamValueChange,
+  advancedSelected,
+  fetchingModels,
 }: {
   cfg: WizardConfig
   apiKey: string
   onApiKeyChange: (v: string) => void
   openaiKey: string
   onOpenaiKeyChange: (v: string) => void
-  activeField: 'anthropic' | 'openai' | 'none'
+  deepseekKey: string
+  onDeepseekKeyChange: (v: string) => void
+  qwenKey: string
+  onQwenKeyChange: (v: string) => void
+  glmKey: string
+  onGlmKeyChange: (v: string) => void
+  activeField: ApiKeyField
   advancedMode: boolean
-  advancedCursor: number
+  advancedSubScreen: 'model-select' | 'param-config'
   advancedRole: string
-  advancedEditing: boolean
-  advancedValue: string
-  onAdvancedValueChange: (v: string) => void
+  flatModelList: FlatModelEntry[]
+  modelListCursor: number
+  paramCursor: number
+  paramEditing: boolean
+  paramValue: string
+  onParamValueChange: (v: string) => void
+  advancedSelected: boolean
+  fetchingModels: boolean
 }): React.ReactNode {
-  const envAnth = process.env.ANTHROPIC_API_KEY ?? ''
+  const envAnth = process.env.ANTHROPIC_AUTH_TOKEN ?? process.env.ANTHROPIC_API_KEY ?? ''
   const envOai = process.env.OPENAI_API_KEY ?? ''
+  const envDs = process.env.DEEPSEEK_API_KEY ?? ''
+  const envQwen = process.env.DASHSCOPE_API_KEY ?? process.env.QWEN_API_KEY ?? ''
+  const envGlm = process.env.ZHIPU_API_KEY ?? process.env.GLM_API_KEY ?? ''
   const effectiveAnth = apiKey || envAnth
   const effectiveOai = openaiKey || envOai
+  const effectiveDs = deepseekKey || envDs
+  const effectiveQwen = qwenKey || envQwen
+  const effectiveGlm = glmKey || envGlm
 
-  if (advancedMode) {
-    const adv = cfg.advanced_models?.[advancedRole] ?? {}
-    const ADVANCED_FIELDS = [
-      {
-        label: 'API Key Override',
-        key: 'api_key',
-        value: adv.api_key ? '****' + adv.api_key.slice(-4) : '(default)',
-      },
-      {
-        label: 'Base URL',
-        key: 'base_url',
-        value: adv.base_url || '(default)',
-      },
-      {
-        label: 'Max Output Tokens',
-        key: 'max_output_tokens',
-        value: String(adv.max_output_tokens ?? '(default)'),
-      },
-      {
-        label: 'Thinking Effort',
-        key: 'thinking_effort',
-        value: adv.thinking_effort ?? '(default)',
-      },
-      {
-        label: 'Context Window',
-        key: 'context_window',
-        value: String(adv.context_window ?? '(default)'),
-      },
-      {
-        label: 'Temperature',
-        key: 'temperature',
-        value: String(adv.temperature ?? '(default)'),
-      },
-    ]
-    const roleLabel =
-      MODEL_ROLES.find(r => r.key === advancedRole)?.label ?? advancedRole
+  const roleLabel = MODEL_ROLES.find(r => r.key === advancedRole)?.label ?? advancedRole
+  const currentModelSpec = cfg.models[advancedRole]
+
+  if (advancedMode && advancedSubScreen === 'model-select') {
+    // Windowed display: show ~14 items centered on cursor
+    const WINDOW_SIZE = 14
+    const half = Math.floor(WINDOW_SIZE / 2)
+    let start = Math.max(0, modelListCursor - half)
+    let end = Math.min(flatModelList.length, start + WINDOW_SIZE)
+    if (end - start < WINDOW_SIZE) start = Math.max(0, end - WINDOW_SIZE)
+    const visible = flatModelList.slice(start, end)
 
     return (
       <Box flexDirection="column" gap={1} paddingLeft={1}>
-        <Text bold>
-          Step 1/6: Advanced Config — {roleLabel} ({cfg.models[advancedRole]})
-        </Text>
+        <Text bold>Step 1/6: Advanced Config — Model Selection</Text>
+        <Box>
+          <Text>  Role: </Text>
+          <Text color="cyan" bold>◀ {roleLabel} ▶</Text>
+          <Text dimColor>            Current: {currentModelSpec}</Text>
+        </Box>
+        {fetchingModels && <Text dimColor>  (fetching latest models...)</Text>}
         <Box flexDirection="column">
-          {ADVANCED_FIELDS.map((f, i) => (
+          {start > 0 && <Text dimColor>  ↑ more</Text>}
+          {visible.map((entry, vi) => {
+            const globalIdx = start + vi
+            if (entry.type === 'provider-header') {
+              return (
+                <Box key={`hdr-${entry.provider}`}>
+                  <Text bold color="yellow">  {entry.displayName}</Text>
+                </Box>
+              )
+            }
+            const isCursor = globalIdx === modelListCursor
+            const isSelected = entry.modelSpec === currentModelSpec
+            const ctx = fmtCtx(entry.max_input_tokens)
+            return (
+              <Box key={entry.modelSpec}>
+                <Box width={2}><Text>{isCursor ? '>' : ' '}</Text></Box>
+                <Box width={36}>
+                  <Text bold={isCursor} color={isCursor ? 'cyan' : undefined}>
+                    {entry.model}
+                  </Text>
+                </Box>
+                <Box width={12}>
+                  <Text dimColor>{ctx}</Text>
+                </Box>
+                {isSelected && <Text color="green">✓</Text>}
+              </Box>
+            )
+          })}
+          {end < flatModelList.length && <Text dimColor>  ↓ more</Text>}
+        </Box>
+        <Text dimColor>
+          Up/Down: select | Enter: confirm | Left/Right: switch role
+        </Text>
+        <Text dimColor>
+          Tab: configure params | Esc: back
+        </Text>
+      </Box>
+    )
+  }
+
+  if (advancedMode && advancedSubScreen === 'param-config') {
+    const fields = getParamFields(advancedRole, cfg, flatModelList)
+
+    return (
+      <Box flexDirection="column" gap={1} paddingLeft={1}>
+        <Text bold>Step 1/6: Advanced Config — Parameters ({roleLabel})</Text>
+        <Text dimColor>  Model: {currentModelSpec}</Text>
+        <Box flexDirection="column">
+          {fields.map((f, i) => (
             <Box key={f.key}>
               <Box width={2}>
-                <Text>{advancedCursor === i ? '>' : ' '}</Text>
+                <Text>{paramCursor === i ? '>' : ' '}</Text>
               </Box>
               <Box width={22}>
                 <Text dimColor>{f.label}:</Text>
               </Box>
-              {advancedEditing && advancedCursor === i ? (
+              {paramEditing && paramCursor === i ? (
                 <TextInput
-                  value={advancedValue}
-                  onChange={onAdvancedValueChange}
+                  value={paramValue}
+                  onChange={onParamValueChange}
                   placeholder={f.value}
                 />
               ) : (
                 <Text
-                  bold={advancedCursor === i}
-                  color={advancedCursor === i ? 'cyan' : undefined}
+                  bold={paramCursor === i}
+                  color={paramCursor === i ? 'cyan' : undefined}
                 >
                   {f.value}
                 </Text>
@@ -373,8 +561,10 @@ function ModelConfigStep({
           ))}
         </Box>
         <Text dimColor>
-          Up/Down: navigate | Enter: edit/save | Left/Right: switch role | Esc:
-          back
+          Up/Down: navigate | Enter: edit/save | Left/Right: switch role
+        </Text>
+        <Text dimColor>
+          Tab: back to model list | Esc: back
         </Text>
       </Box>
     )
@@ -392,7 +582,7 @@ function ModelConfigStep({
               bold={activeField === 'anthropic'}
               color={activeField === 'anthropic' ? 'cyan' : undefined}
             >
-              Anthropic API Key:
+              Anthropic Key/Token:
             </Text>
           </Box>
           {envAnth && !apiKey ? (
@@ -402,7 +592,7 @@ function ModelConfigStep({
               value={apiKey}
               onChange={onApiKeyChange}
               mask="*"
-              placeholder="sk-ant-..."
+              placeholder="sk-ant-api... or sk-ant-oat01-..."
             />
           ) : (
             <Text>
@@ -435,6 +625,78 @@ function ModelConfigStep({
           ) : (
             <Text dimColor>
               {effectiveOai ? '****' + effectiveOai.slice(-4) : '(optional)'}
+            </Text>
+          )}
+        </Box>
+        <Box>
+          <Box width={22}>
+            <Text
+              bold={activeField === 'deepseek'}
+              color={activeField === 'deepseek' ? 'cyan' : undefined}
+            >
+              DeepSeek API Key:
+            </Text>
+          </Box>
+          {envDs && !deepseekKey ? (
+            <Text color="green">[from env ✓]</Text>
+          ) : activeField === 'deepseek' ? (
+            <TextInput
+              value={deepseekKey}
+              onChange={onDeepseekKeyChange}
+              mask="*"
+              placeholder="sk-... (optional)"
+            />
+          ) : (
+            <Text dimColor>
+              {effectiveDs ? '****' + effectiveDs.slice(-4) : '(optional)'}
+            </Text>
+          )}
+        </Box>
+        <Box>
+          <Box width={22}>
+            <Text
+              bold={activeField === 'qwen'}
+              color={activeField === 'qwen' ? 'cyan' : undefined}
+            >
+              Qwen API Key:
+            </Text>
+          </Box>
+          {envQwen && !qwenKey ? (
+            <Text color="green">[from env ✓]</Text>
+          ) : activeField === 'qwen' ? (
+            <TextInput
+              value={qwenKey}
+              onChange={onQwenKeyChange}
+              mask="*"
+              placeholder="sk-... (optional)"
+            />
+          ) : (
+            <Text dimColor>
+              {effectiveQwen ? '****' + effectiveQwen.slice(-4) : '(optional)'}
+            </Text>
+          )}
+        </Box>
+        <Box>
+          <Box width={22}>
+            <Text
+              bold={activeField === 'glm'}
+              color={activeField === 'glm' ? 'cyan' : undefined}
+            >
+              GLM API Key:
+            </Text>
+          </Box>
+          {envGlm && !glmKey ? (
+            <Text color="green">[from env ✓]</Text>
+          ) : activeField === 'glm' ? (
+            <TextInput
+              value={glmKey}
+              onChange={onGlmKeyChange}
+              mask="*"
+              placeholder="sk-... (optional)"
+            />
+          ) : (
+            <Text dimColor>
+              {effectiveGlm ? '****' + effectiveGlm.slice(-4) : '(optional)'}
             </Text>
           )}
         </Box>
@@ -472,8 +734,14 @@ function ModelConfigStep({
         ))}
       </Box>
 
+      <Box marginTop={1}>
+        <Text bold={advancedSelected} color={advancedSelected ? 'cyan' : undefined}>
+          {advancedSelected ? '> ' : '  '}Advanced Config (per-role overrides)
+        </Text>
+      </Box>
+
       <Text dimColor>
-        Tab: switch key field | a: advanced config | Enter: continue | Esc: back
+        Tab/Shift+Tab: switch field | Enter: {advancedSelected ? 'open advanced' : 'continue'} | Esc: back
       </Text>
     </Box>
   )
@@ -805,15 +1073,26 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
   // Step 1 state
   const [apiKey, setApiKey] = useState('')
   const [openaiKey, setOpenaiKey] = useState('')
-  const [keyField, setKeyField] = useState<'anthropic' | 'openai'>('anthropic')
+  const [deepseekKey, setDeepseekKey] = useState('')
+  const [qwenKey, setQwenKey] = useState('')
+  const [glmKey, setGlmKey] = useState('')
+  const KEY_FIELDS: ApiKeyField[] = ['anthropic', 'openai', 'deepseek', 'qwen', 'glm']
+  const [keyFieldIdx, setKeyFieldIdx] = useState(0)
+  const keyField: ApiKeyField = KEY_FIELDS[keyFieldIdx] ?? 'none'
   const [apiFieldActive, setApiFieldActive] = useState(true)
 
   // Step 1 advanced state
+  const lastEscRef = useRef(0)
   const [advancedMode, setAdvancedMode] = useState(false)
-  const [advancedCursor, setAdvancedCursor] = useState(0)
   const [advancedRoleIdx, setAdvancedRoleIdx] = useState(0)
-  const [advancedEditing, setAdvancedEditing] = useState(false)
-  const [advancedValue, setAdvancedValue] = useState('')
+  const [advancedSubScreen, setAdvancedSubScreen] = useState<'model-select' | 'param-config'>('model-select')
+  const [modelListCursor, setModelListCursor] = useState(0)
+  const [flatModelList, setFlatModelList] = useState<FlatModelEntry[]>([])
+  const [dynamicModels, setDynamicModels] = useState<Record<string, string[]>>({})
+  const [fetchingModels, setFetchingModels] = useState(false)
+  const [paramCursor, setParamCursor] = useState(0)
+  const [paramEditing, setParamEditing] = useState(false)
+  const [paramValue, setParamValue] = useState('')
 
   // Step 2 state
   const [s2Key, setS2Key] = useState('')
@@ -839,7 +1118,7 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
 
   const hasTextInput =
     (step === 1 && !advancedMode && apiFieldActive && keyField !== 'none') ||
-    (step === 1 && advancedMode && advancedEditing) ||
+    (step === 1 && advancedMode && advancedSubScreen === 'param-config' && paramEditing) ||
     (step === 2 && (s2Active || ezproxyActive || pdfFolderActive))
 
   async function runLatexCheck() {
@@ -936,84 +1215,109 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
 
   useInput(
     async (input, key) => {
-      // Step 1: 'a' toggles advanced mode
-      if (step === 1 && !advancedMode && input === 'a') {
-        setAdvancedMode(true)
-        setAdvancedCursor(0)
-        setAdvancedRoleIdx(0)
-        return
-      }
       // Step 1 advanced: navigation
       if (step === 1 && advancedMode) {
-        if (key.escape) {
-          setAdvancedMode(false)
-          setAdvancedEditing(false)
-          return
-        }
-        if (key.upArrow) {
-          setAdvancedCursor(c => Math.max(0, c - 1))
-          return
-        }
-        if (key.downArrow) {
-          setAdvancedCursor(c => Math.min(5, c + 1))
-          return
-        }
-        if (key.leftArrow) {
-          setAdvancedRoleIdx(
-            i => (i - 1 + MODEL_ROLES.length) % MODEL_ROLES.length,
-          )
-          return
-        }
-        if (key.rightArrow) {
-          setAdvancedRoleIdx(i => (i + 1) % MODEL_ROLES.length)
-          return
-        }
-        if (key.return && !advancedEditing) {
-          setAdvancedEditing(true)
-          const role = MODEL_ROLES[advancedRoleIdx].key
-          const adv = cfg.advanced_models?.[role] ?? {}
-          const keys = [
-            'api_key',
-            'base_url',
-            'max_output_tokens',
-            'thinking_effort',
-            'context_window',
-            'temperature',
-          ]
-          const k = keys[advancedCursor] as keyof AdvancedModelConfig
-          setAdvancedValue(adv[k] != null ? String(adv[k]) : '')
-          return
-        }
-        if (key.return && advancedEditing) {
-          // Save the advanced value
-          const role = MODEL_ROLES[advancedRoleIdx].key
-          const keys = [
-            'api_key',
-            'base_url',
-            'max_output_tokens',
-            'thinking_effort',
-            'context_window',
-            'temperature',
-          ]
-          const k = keys[advancedCursor]
-          setCfg(prev => {
-            const existing = prev.advanced_models?.[role] ?? {}
-            let val: any = advancedValue
-            if (k === 'max_output_tokens' || k === 'context_window')
-              val = parseInt(advancedValue, 10) || undefined
-            if (k === 'temperature')
-              val = parseFloat(advancedValue) || undefined
-            if (!advancedValue) val = undefined
-            return {
-              ...prev,
-              advanced_models: {
-                ...(prev.advanced_models ?? {}),
-                [role]: { ...existing, [k]: val },
-              },
+        if (advancedSubScreen === 'model-select') {
+          if (key.escape) {
+            lastEscRef.current = Date.now()
+            setAdvancedMode(false)
+            return
+          }
+          if (key.upArrow) {
+            setModelListCursor(c => nextModelIdx(flatModelList, c, -1))
+            return
+          }
+          if (key.downArrow) {
+            setModelListCursor(c => nextModelIdx(flatModelList, c, 1))
+            return
+          }
+          if (key.leftArrow) {
+            setAdvancedRoleIdx(i => {
+              const newIdx = (i - 1 + MODEL_ROLES.length) % MODEL_ROLES.length
+              const newRole = MODEL_ROLES[newIdx].key
+              const curModel = cfg.models[newRole]
+              const idx = flatModelList.findIndex(e => e.modelSpec === curModel)
+              setModelListCursor(idx >= 0 ? idx : Math.max(0, flatModelList.findIndex(e => e.type === 'model')))
+              return newIdx
+            })
+            return
+          }
+          if (key.rightArrow) {
+            setAdvancedRoleIdx(i => {
+              const newIdx = (i + 1) % MODEL_ROLES.length
+              const newRole = MODEL_ROLES[newIdx].key
+              const curModel = cfg.models[newRole]
+              const idx = flatModelList.findIndex(e => e.modelSpec === curModel)
+              setModelListCursor(idx >= 0 ? idx : Math.max(0, flatModelList.findIndex(e => e.type === 'model')))
+              return newIdx
+            })
+            return
+          }
+          if (key.return) {
+            const entry = flatModelList[modelListCursor]
+            if (entry?.type === 'model' && entry.modelSpec) {
+              const role = MODEL_ROLES[advancedRoleIdx].key
+              setCfg(prev => ({
+                ...prev,
+                models: { ...prev.models, [role]: entry.modelSpec! },
+              }))
             }
-          })
-          setAdvancedEditing(false)
-          setAdvancedValue('')
+            return
+          }
+          if (key.tab) {
+            setAdvancedSubScreen('param-config')
+            setParamCursor(0)
+            return
+          }
+          return
+        }
+        if (advancedSubScreen === 'param-config' && !paramEditing) {
+          if (key.escape) {
+            lastEscRef.current = Date.now()
+            setAdvancedMode(false)
+            return
+          }
+          if (key.upArrow) {
+            setParamCursor(c => Math.max(0, c - 1))
+            return
+          }
+          if (key.downArrow) {
+            const role = MODEL_ROLES[advancedRoleIdx].key
+            const maxIdx = getParamFields(role, cfg, flatModelList).length - 1
+            setParamCursor(c => Math.min(maxIdx, c + 1))
+            return
+          }
+          if (key.leftArrow) {
+            setAdvancedRoleIdx(i => (i - 1 + MODEL_ROLES.length) % MODEL_ROLES.length)
+            setParamCursor(0)
+            return
+          }
+          if (key.rightArrow) {
+            setAdvancedRoleIdx(i => (i + 1) % MODEL_ROLES.length)
+            setParamCursor(0)
+            return
+          }
+          if (key.return) {
+            const role = MODEL_ROLES[advancedRoleIdx].key
+            const fields = getParamFields(role, cfg, flatModelList)
+            const field = fields[paramCursor]
+            if (field) {
+              setParamEditing(true)
+              const adv = cfg.advanced_models?.[role] ?? {}
+              const k = field.key as keyof AdvancedModelConfig
+              setParamValue(adv[k] != null ? String(adv[k]) : '')
+            }
+            return
+          }
+          if (key.tab) {
+            setAdvancedSubScreen('model-select')
+            // Position cursor on current role's model
+            const role = MODEL_ROLES[advancedRoleIdx].key
+            const curModel = cfg.models[role]
+            const idx = flatModelList.findIndex(e => e.modelSpec === curModel)
+            setModelListCursor(idx >= 0 ? idx : Math.max(0, flatModelList.findIndex(e => e.type === 'model')))
+            return
+          }
           return
         }
         return
@@ -1053,14 +1357,16 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
         setS2Active(a => !a)
         return
       }
-      // Step 1: Tab cycles anthropic/openai key fields
+      // Step 1: Tab/Shift+Tab cycles key fields + advanced config
       if (step === 1 && key.tab) {
-        setKeyField(f => (f === 'anthropic' ? 'openai' : 'anthropic'))
+        const total = KEY_FIELDS.length + 1
+        setKeyFieldIdx(i => key.shift ? (i - 1 + total) % total : (i + 1) % total)
         return
       }
 
       // Escape: go back to previous step
       if (key.escape && step > 0) {
+        if (Date.now() - lastEscRef.current < 300) return
         setStep(s => s - 1)
         return
       }
@@ -1092,15 +1398,69 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
           setStep(1)
           break
         case 1:
-          setCfg(prev => ({
-            ...prev,
-            api_keys: {
-              ...prev.api_keys,
-              anthropic: apiKey || process.env.ANTHROPIC_API_KEY || '',
-              openai: openaiKey || process.env.OPENAI_API_KEY || '',
-            },
-          }))
-          setStep(2)
+          if (keyFieldIdx >= KEY_FIELDS.length) {
+            // Sync input state vars to cfg BEFORE building model list
+            const updatedCfg = {
+              ...cfg,
+              api_keys: {
+                ...cfg.api_keys,
+                ...routeAnthropicKey(resolveAnthropicInput(apiKey)),
+                openai: openaiKey || process.env.OPENAI_API_KEY || '',
+                deepseek: deepseekKey || process.env.DEEPSEEK_API_KEY || '',
+                qwen: qwenKey || process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY || '',
+                glm: glmKey || process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY || '',
+              },
+            }
+            setCfg(updatedCfg)
+
+            setAdvancedMode(true)
+            setAdvancedSubScreen('model-select')
+            setAdvancedRoleIdx(0)
+            // Build flat model list from static catalog + any dynamic models
+            const list = buildFlatModelList(updatedCfg, dynamicModels)
+            setFlatModelList(list)
+            // Position cursor on current role's selected model
+            const currentModel = updatedCfg.models[MODEL_ROLES[0].key]
+            const idx = list.findIndex(e => e.modelSpec === currentModel)
+            setModelListCursor(idx >= 0 ? idx : Math.max(0, list.findIndex(e => e.type === 'model')))
+            // Background fetch dynamic models (only first time)
+            if (!fetchingModels && Object.keys(dynamicModels).length === 0) {
+              setFetchingModels(true)
+              // Snapshot keys before async to avoid stale closure
+              const keysSnapshot = { ...updatedCfg.api_keys }
+              const cfgSnapshot = { ...updatedCfg }
+              void (async () => {
+                const keys: Record<string, string> = {
+                  openai: keysSnapshot.openai || process.env.OPENAI_API_KEY || '',
+                  deepseek: keysSnapshot.deepseek || process.env.DEEPSEEK_API_KEY || '',
+                  qwen: keysSnapshot.qwen || process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY || '',
+                  glm: keysSnapshot.glm || process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY || '',
+                }
+                const results: Record<string, string[]> = {}
+                await Promise.all(
+                  Object.entries(keys).map(async ([p, k]) => {
+                    if (k) results[p] = await fetchProviderModels(p, k)
+                  })
+                )
+                setDynamicModels(results)
+                setFlatModelList(buildFlatModelList(cfgSnapshot, results))
+                setFetchingModels(false)
+              })()
+            }
+          } else {
+            setCfg(prev => ({
+              ...prev,
+              api_keys: {
+                ...prev.api_keys,
+                ...routeAnthropicKey(resolveAnthropicInput(apiKey)),
+                openai: openaiKey || process.env.OPENAI_API_KEY || '',
+                deepseek: deepseekKey || process.env.DEEPSEEK_API_KEY || '',
+                qwen: qwenKey || process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY || '',
+                glm: glmKey || process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY || '',
+              },
+            }))
+            setStep(2)
+          }
           break
         case 2:
           setCfg(prev => ({
@@ -1144,8 +1504,53 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
   // Separate handler for text input active steps
   useInput(
     async (_input, key) => {
+      // Step 1 advanced: param editing (Enter to save, Esc to cancel)
+      if (step === 1 && advancedMode && advancedSubScreen === 'param-config' && paramEditing) {
+        if (key.return) {
+          const role = MODEL_ROLES[advancedRoleIdx].key
+          const fields = getParamFields(role, cfg, flatModelList)
+          const field = fields[paramCursor]
+          if (field) {
+            const k = field.key
+            setCfg(prev => {
+              const existing = prev.advanced_models?.[role] ?? {}
+              let val: any = paramValue
+              if (k === 'max_output_tokens') {
+                const parsed = parseInt(paramValue, 10)
+                val = Number.isNaN(parsed) ? undefined : parsed
+              }
+              if (k === 'temperature') {
+                const parsed = parseFloat(paramValue)
+                val = Number.isNaN(parsed) ? undefined : parsed
+              }
+              if (k === 'thinking_effort') {
+                const allowed = ['low', 'medium', 'high', 'max']
+                val = allowed.includes(paramValue) ? paramValue : undefined
+              }
+              if (!paramValue) val = undefined
+              return {
+                ...prev,
+                advanced_models: {
+                  ...(prev.advanced_models ?? {}),
+                  [role]: { ...existing, [k]: val },
+                },
+              }
+            })
+          }
+          setParamEditing(false)
+          setParamValue('')
+          return
+        }
+        if (key.escape) {
+          setParamEditing(false)
+          setParamValue('')
+          return
+        }
+        return
+      }
       if (step === 1 && key.tab) {
-        setKeyField(f => (f === 'anthropic' ? 'openai' : 'anthropic'))
+        const total = KEY_FIELDS.length + 1
+        setKeyFieldIdx(i => key.shift ? (i - 1 + total) % total : (i + 1) % total)
         return
       }
       if (step === 2 && key.tab) {
@@ -1160,6 +1565,7 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
         return
       }
       if (key.escape && step > 0) {
+        if (Date.now() - lastEscRef.current < 300) return
         setStep(s => s - 1)
         return
       }
@@ -1169,8 +1575,11 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
             ...prev,
             api_keys: {
               ...prev.api_keys,
-              anthropic: apiKey || process.env.ANTHROPIC_API_KEY || '',
+              ...routeAnthropicKey(resolveAnthropicInput(apiKey)),
               openai: openaiKey || process.env.OPENAI_API_KEY || '',
+              deepseek: deepseekKey || process.env.DEEPSEEK_API_KEY || '',
+              qwen: qwenKey || process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY || '',
+              glm: glmKey || process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY || '',
             },
           }))
           setStep(2)
@@ -1199,13 +1608,24 @@ export function PaperOnboarding({ onDone }: Props): React.ReactNode {
         onApiKeyChange={setApiKey}
         openaiKey={openaiKey}
         onOpenaiKeyChange={setOpenaiKey}
+        deepseekKey={deepseekKey}
+        onDeepseekKeyChange={setDeepseekKey}
+        qwenKey={qwenKey}
+        onQwenKeyChange={setQwenKey}
+        glmKey={glmKey}
+        onGlmKeyChange={setGlmKey}
         activeField={apiFieldActive ? keyField : 'none'}
         advancedMode={advancedMode}
-        advancedCursor={advancedCursor}
+        advancedSubScreen={advancedSubScreen}
         advancedRole={MODEL_ROLES[advancedRoleIdx]?.key ?? 'research'}
-        advancedEditing={advancedEditing}
-        advancedValue={advancedValue}
-        onAdvancedValueChange={setAdvancedValue}
+        flatModelList={flatModelList}
+        modelListCursor={modelListCursor}
+        paramCursor={paramCursor}
+        paramEditing={paramEditing}
+        paramValue={paramValue}
+        onParamValueChange={setParamValue}
+        advancedSelected={keyFieldIdx >= KEY_FIELDS.length && !advancedMode}
+        fetchingModels={fetchingModels}
       />
     ),
     2: (

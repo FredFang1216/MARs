@@ -52,7 +52,11 @@
     "publish:dev": "bun run scripts/publish-dev.js",
     "publish:release": "bun run scripts/publish-release.js",
     "bench:startup": "bun run scripts/bench-startup.mjs",
-    "parity:reference": "bun run scripts/reference-parity-check.mjs"
+    "parity:reference": "bun run scripts/reference-parity-check.mjs",
+    "web:dev": "cd web && bunx vite",
+    "web:build": "cd web && bunx vite build",
+    "web:serve": "bun run src/entrypoints/web.ts",
+    "web:start": "bun run web:build && bun run web:serve"
   },
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.12.6",

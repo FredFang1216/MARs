@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 import type { Proposal } from './proposal/types'
+import type { ExperimentPlan } from './experiments/types'
 import { chatCompletion } from './llm-client'
 import { DEFAULT_MODEL_ASSIGNMENTS } from './types'
 import { ClaimGraph, type ClaimInput } from './claim-graph/index'
@@ -203,6 +204,9 @@ export interface ResearchState {
 
   // Domain knowledge packs loaded in this session
   loaded_knowledge_packs: string[]
+
+  // Experiment plan (generated from proposal before orchestration starts)
+  experiment_plan?: ExperimentPlan | null
 
   // Meta
   initialized: boolean
