@@ -21,6 +21,9 @@ import {
   setActiveDKPLoader,
   type ExecutionContext,
 } from './tools/tool-context'
+import { registry } from './tools/registry'
+import { registerAllTools } from './tools/bridge'
+import { runToolCalls, type ToolExecContext } from './tools'
 import {
   executeWebSearch,
   executeWebFetch,
@@ -513,6 +516,22 @@ export {
   CITATION_TOOLS, DATA_TOOLS, INFRA_TOOLS,
 } from './tools/paper-tools'
 
+// ── Register all tools in the new ToolRegistry ───────────
+// This bridges the old ToolDefinition[] arrays into the new system.
+// The executeTool() function is passed as the executor so bridged tools
+// delegate to the exact same implementation as before.
+// Lazy init: done once on first call to ensure executeTool is defined.
+let registryInitialized = false
+function ensureRegistryInitialized(): void {
+  if (registryInitialized) return
+  registryInitialized = true
+  registerAllTools(
+    [BASE_TOOLS, RESEARCH_TOOLS, DK_TOOLS,
+     WEB_TOOLS, GITHUB_TOOLS, MATH_TOOLS, HF_TOOLS, ACADEMIC_TOOLS,
+     CITATION_TOOLS, DATA_TOOLS, INFRA_TOOLS],
+    executeTool,
+  )
+}
 
 /** Initialize DKP loader for agent tool execution. Called by orchestrator. */
 export function initAgentDKP(state: ResearchState, packsDir?: string): void {
@@ -1670,26 +1689,38 @@ When you have finished, provide your final results in the following JSON format 
         break
       }
 
-      // Execute tool calls and collect results
-      const toolResultParts: string[] = []
-      for (const tc of response.tool_calls) {
-        // No need to re-set globals per tool call — executionContext.run() provides
-        // isolated workingDir and dkpLoader via AsyncLocalStorage, safe across awaits.
+      // Execute tool calls — concurrent-safe tools run in parallel,
+      // unsafe tools run serially (inspired by Claude Code's toolOrchestration).
+      ensureRegistryInitialized()
+      const toolCalls = response.tool_calls.map(tc => ({
+        name: tc.name,
+        input: tc.input,
+      }))
 
-        // Report progress: what tool is being called and with what input
-        if (onProgress) {
-          const toolLabel = formatToolProgress(tc.name, tc.input)
-          onProgress(`  ${agentName} → ${toolLabel}`)
+      // Report progress before execution
+      if (onProgress) {
+        for (const tc of response.tool_calls) {
+          onProgress(`  ${agentName} → ${formatToolProgress(tc.name, tc.input)}`)
         }
-        const result = await executeTool(tc.name, tc.input)
-        // Report tool result summary
+      }
+
+      const toolCtx: ToolExecContext = { workingDir, signal: undefined }
+      const toolResults = await runToolCalls(toolCalls, registry, toolCtx)
+
+      // Report results and build message parts
+      const toolResultParts: string[] = []
+      for (let i = 0; i < response.tool_calls.length; i++) {
+        const tc = response.tool_calls[i]
+        const resultData = typeof toolResults[i].data === 'string'
+          ? toolResults[i].data
+          : JSON.stringify(toolResults[i].data)
         if (onProgress) {
-          const resultSummary = summarizeToolResult(tc.name, tc.input, result)
+          const resultSummary = summarizeToolResult(tc.name, tc.input, resultData)
           if (resultSummary) {
             onProgress(`  ${resultSummary}`)
           }
         }
-        toolResultParts.push(`[Tool: ${tc.name}]\n${result}`)
+        toolResultParts.push(`[Tool: ${tc.name}]\n${resultData}`)
       }
 
       // Append the assistant's response and tool results to the conversation
