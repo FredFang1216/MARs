@@ -1,9 +1,9 @@
 \documentclass{article}
 
 % ============================================================
-% ICML 2026 Style Setup
+% ICLR 2026 Style Setup
 % ============================================================
-\usepackage{icml2026}
+\usepackage{iclr2026_conference}
 
 % ============================================================
 % Standard Packages
@@ -17,49 +17,40 @@
 \usepackage{booktabs}
 \usepackage{hyperref}
 \usepackage{url}
-\usepackage{natbib}
 \usepackage{microtype}
 \usepackage{xcolor}
 \usepackage{algorithm}
 \usepackage{algorithmic}
 
 % ============================================================
+% Math Commands (from ICLR official template)
+% ============================================================
+\input{math_commands}
+
+% ============================================================
 % Custom Commands
 % ============================================================
-\newcommand{\R}{\mathbb{R}}
-\newcommand{\E}{\mathbb{E}}
-\newcommand{\Var}{\mathrm{Var}}
 \DeclareMathOperator*{\argmin}{arg\,min}
 \DeclareMathOperator*{\argmax}{arg\,max}
 
 % ============================================================
 % Document Metadata
 % ============================================================
-\icmltitlerunning{Paper Title}
+\title{Paper Title}
 
+\author{
+  Anonymous Author(s) \\
+  \texttt{anonymous@example.com}
+}
+
+\iclrfinalcopy  % Remove this line for anonymous submission
+
+% ============================================================
+% Document Body
+% ============================================================
 \begin{document}
 
-\twocolumn[
-\icmltitle{Paper Title}
-
-\icmlsetsymbol{equal}{*}
-
-\begin{icmlauthorlist}
-\icmlauthor{Author One}{aff1}
-\icmlauthor{Author Two}{aff2}
-\end{icmlauthorlist}
-
-\icmlaffiliation{aff1}{Affiliation One}
-\icmlaffiliation{aff2}{Affiliation Two}
-
-\icmlcorrespondingauthor{Author One}{author1@example.com}
-
-\icmlkeywords{Machine Learning, ICML}
-
-\vskip 0.3in
-]
-
-\printAffiliationsAndNotice{}
+\maketitle
 
 \input{sections/abstract}
 \input{sections/introduction}
@@ -73,6 +64,6 @@
 % References
 % ============================================================
 \bibliography{references}
-\bibliographystyle{icml2026}
+\bibliographystyle{iclr2026_conference}
 
 \end{document}

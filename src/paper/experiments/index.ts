@@ -30,3 +30,18 @@ export { ExperimentPlanGenerator, summarizeExperimentPlan } from './plan-generat
 export { DataPrefetcher } from './data-prefetch'
 export { PlanExecutor } from './plan-executor'
 export { ExperimentEvidenceConverter } from './evidence-converter'
+export {
+  evaluateExperiment,
+  buildClaimExperimentHistory,
+  buildExperimentFeedbackContext,
+} from './experiment-evaluator'
+export type {
+  ExperimentEvaluation,
+  ClaimExperimentHistory,
+  RetreatSignal,
+  BaselineRelation,
+  BreakthroughLevel,
+  FailureMode,
+  ClaimUpdateSignal,
+  RecommendedRoute,
+} from './experiment-evaluator'

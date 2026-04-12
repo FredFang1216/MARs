@@ -1,0 +1,45 @@
+{
+  "page_limits": {
+    "main_body": 10,
+    "references": "unlimited",
+    "appendix": "unlimited",
+    "total_with_appendix": null
+  },
+  "structure": {
+    "required_sections": ["abstract", "introduction", "related-work", "methodology", "experiments", "conclusion"],
+    "optional_sections": ["results", "discussion", "limitations", "reproducibility"],
+    "appendix_typical": ["proofs", "additional-experiments", "hyperparameters", "reproducibility-statement"],
+    "abstract_word_limit": "unlimited"
+  },
+  "formatting": {
+    "columns": 1,
+    "font_size": "11pt",
+    "figure_placement": "top",
+    "table_style": "booktabs",
+    "citation_style": "natbib-author-year",
+    "max_figure_width_single_col": "\\textwidth"
+  },
+  "writing_guidelines": {
+    "main_body_strategy": "Clear exposition with strong motivation. Emphasize novelty and theoretical understanding. ICLR values understanding over pure empirical results.",
+    "figure_strategy": "Single-column layout allows wider figures. Use clear, informative plots.",
+    "table_strategy": "Booktabs style. Bold best values. Include error bars or confidence intervals.",
+    "proof_strategy": "Key theoretical insights in main body, full proofs in appendix.",
+    "related_work_placement": "Typically after introduction or before conclusion.",
+    "page_budget": {
+      "abstract": 0.25,
+      "introduction": 1.5,
+      "related-work": 1.5,
+      "methodology": 3.0,
+      "experiments": 2.5,
+      "results": 1.0,
+      "conclusion": 0.5
+    }
+  },
+  "common_pitfalls": [
+    "Exceeding 10-page main body limit",
+    "Not using the official ICLR style file",
+    "Forgetting double-blind anonymization (no author names, no identifying URLs)",
+    "Not providing a reproducibility statement",
+    "Missing ablation studies or analysis of why the method works"
+  ]
+}

@@ -313,7 +313,7 @@ export class ExperimentEvidenceConverter {
     return false
   }
 
-  private evaluateVsBaseline(
+  evaluateVsBaseline(
     metrics: MetricsJson,
     criteria: string,
   ): boolean {
@@ -352,7 +352,7 @@ export class ExperimentEvidenceConverter {
     return total > 0 && wins / total > 0.5
   }
 
-  private averageOOS(
+  averageOOS(
     metrics: MetricsJson,
     modelNames: string[],
   ): Record<string, number> {
@@ -376,7 +376,7 @@ export class ExperimentEvidenceConverter {
     return result
   }
 
-  private flattenMetrics(
+  flattenMetrics(
     metrics: MetricsJson,
   ): Array<{ model: string; metric: string; value: number }> {
     const results: Array<{ model: string; metric: string; value: number }> = []

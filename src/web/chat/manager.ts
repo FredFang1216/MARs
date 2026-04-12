@@ -57,7 +57,7 @@ import { addPaperToAcquired } from '../../paper/literature-db'
 const MAX_CONTEXT_MESSAGES = 40
 
 // Maximum number of tool call rounds per user message
-const MAX_TOOL_ROUNDS = 15
+const MAX_TOOL_ROUNDS = 20
 // Maximum truncation recovery retries
 const MAX_TRUNCATION_RETRIES = 3
 // Keep only the last N rounds of tool results in full context

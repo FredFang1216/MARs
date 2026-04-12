@@ -17,6 +17,8 @@ import {
   initializeFromProposal,
   saveResearchState,
 } from '../../paper/research-state'
+import { syncPlanFromState } from '../../paper/research-plan'
+import { refreshScoreboard } from '../../paper/method-scoreboard'
 import { probeSystem } from '../../paper/system-probe'
 import { DEFAULT_MODEL_ASSIGNMENTS } from '../../paper/types'
 import { extractModelId } from '../../paper/agent-dispatch'
@@ -438,6 +440,10 @@ export class CreationManager {
 
     saveResearchState(projectDir, state)
 
+    // Sync durable plan files and scoreboard
+    try { syncPlanFromState(projectDir, state) } catch { /* non-critical */ }
+    try { refreshScoreboard(projectDir, state) } catch { /* non-critical */ }
+
     // Write session.json so it appears in session list
     const metaPath = join(projectDir, SESSION_META)
     if (!existsSync(metaPath)) {
@@ -526,6 +532,11 @@ export class CreationManager {
     })
 
     saveResearchState(projectDir, state)
+
+    // Sync durable plan files and scoreboard
+    try { syncPlanFromState(projectDir, state) } catch { /* non-critical */ }
+    try { refreshScoreboard(projectDir, state) } catch { /* non-critical */ }
+
     emit('Research state initialized')
 
     // ── Complete ────────────────────────────────────────────
@@ -589,6 +600,10 @@ export class CreationManager {
     })
 
     saveResearchState(projectDir, state)
+
+    // Sync durable plan files and scoreboard
+    try { syncPlanFromState(projectDir, state) } catch { /* non-critical */ }
+    try { refreshScoreboard(projectDir, state) } catch { /* non-critical */ }
 
     // Write session.json
     const metaPath = join(projectDir, SESSION_META)

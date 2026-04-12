@@ -181,6 +181,13 @@ You make three decisions:
 
 3. CONTRACTED CLAIMS: For any claim being contracted, provide the new (weaker) statement.
 
+EXPERIMENT FEEDBACK & RETREAT POLICY (thresholds must match STAGNATION_THRESHOLD in experiment-evaluator.ts):
+When you see "RETREAT RECOMMENDED" or "Active Retreat Signals" for a claim:
+- If consecutive failures >= 2 (stagnant): You MUST reformulate or demote the claim, not schedule more experiments.
+- If consecutive failures == 1: Strongly consider revising the experimental approach (contract to weaker layer, or reformulate).
+- If failure_mode is "direction": The hypothesis direction may be wrong. Consider reformulation with a different mechanism.
+- Do NOT schedule another experiment on a stagnant claim without first reformulating or contracting it.
+
 A weaker but correct claim is always better than a stronger but unsupported one.
 
 Output JSON:

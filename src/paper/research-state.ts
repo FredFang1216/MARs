@@ -149,6 +149,8 @@ export interface TrajectoryEntry {
   builder_output_summary?: string
   skeptic_challenges_summary?: string
   arbiter_decision_summary?: string
+  // Experiment evaluation (feedback loop)
+  experiment_evaluation?: import('./experiments/experiment-evaluator').ExperimentEvaluation
   // Effort controller tracking
   effort_levels?: {
     builder: 'medium' | 'high'
@@ -207,6 +209,12 @@ export interface ResearchState {
 
   // Experiment plan (generated from proposal before orchestration starts)
   experiment_plan?: ExperimentPlan | null
+
+  // Experiment feedback (evaluation history for retreat detection)
+  experiment_feedback?: {
+    evaluations: import('./experiments/experiment-evaluator').ExperimentEvaluation[]
+    claim_histories: Record<string, import('./experiments/experiment-evaluator').ClaimExperimentHistory>
+  }
 
   // Meta
   initialized: boolean

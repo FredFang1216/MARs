@@ -166,6 +166,125 @@ export function updateConfig(config: Record<string, any>): Promise<any> {
   return put('/api/config', config)
 }
 
+// ── Templates ────────────────────────────────────────
+
+export interface TemplateEntry {
+  id: string
+  name: string
+  aliases: string[]
+  venue_type: string
+  field: string
+  path: string
+}
+
+export function fetchTemplates(): Promise<TemplateEntry[]> {
+  return get('/api/templates')
+}
+
+export function fetchTemplate(templateId: string): Promise<{
+  manifest: Record<string, any>
+  constraints: Record<string, any>
+}> {
+  return get(`/api/templates/${encodeURIComponent(templateId)}`)
+}
+
+// ── System Check ─────────────────────────────────────
+
+export interface SystemCapabilities {
+  gpu: boolean
+  gpu_name?: string
+  vram_gb?: number
+  python: boolean
+  python_version?: string
+  conda: boolean
+  docker: boolean
+  latex: boolean
+  r: boolean
+}
+
+export function fetchSystemCheck(): Promise<SystemCapabilities> {
+  return get('/api/system-check')
+}
+
+// ── Unified Status ───────────────────────────────────
+
+export interface UnifiedStatus {
+  topic: string
+  paper_type: string
+  cycle: number
+  claims: {
+    total: number
+    admitted: number
+    proposed: number
+    investigating: number
+    rejected: number
+    reformulated: number
+  }
+  convergence: number
+  paper_readiness: string
+  evidence: {
+    total: number
+    grounded: number
+    derived: number
+  }
+  budget: {
+    total_usd: number
+    remaining_usd: number
+    spent_usd: number
+  }
+  proofs: number
+  artifacts: number
+  has_pdf: boolean
+  experiment_feedback: {
+    total_evaluations: number
+    stagnant_claims: number
+  } | null
+}
+
+export function fetchUnifiedStatus(sessionId: string): Promise<UnifiedStatus> {
+  return get(`/api/sessions/${sessionId}/status`)
+}
+
+// ── Fragments ────────────────────────────────────────
+
+export function fetchFragments(sessionId: string): Promise<any[]> {
+  return get(`/api/sessions/${sessionId}/fragments`)
+}
+
+export function fetchFragment(sessionId: string, fragmentId: string): Promise<any> {
+  return get(`/api/sessions/${sessionId}/fragments/${encodeURIComponent(fragmentId)}`)
+}
+
+// ── Experiment Promote ───────────────────────────────
+
+export function promoteExperiment(sessionId: string, probeId: string): Promise<any> {
+  return post(`/api/sessions/${sessionId}/experiments/${encodeURIComponent(probeId)}/promote`)
+}
+
+// ── Research Plan & Decision Artifacts ───────────────
+
+export function fetchResearchPlan(sessionId: string): Promise<any> {
+  return get(`/api/sessions/${sessionId}/research-plan`)
+}
+
+export function fetchDecisions(sessionId: string, count = 10): Promise<any[]> {
+  return get(`/api/sessions/${sessionId}/decisions?count=${count}`)
+}
+
+export function fetchMethodScoreboard(sessionId: string): Promise<any> {
+  return get(`/api/sessions/${sessionId}/method-scoreboard`)
+}
+
+export function fetchArtifacts(sessionId: string): Promise<any> {
+  return get(`/api/sessions/${sessionId}/artifacts`)
+}
+
+// ── Paper PDF ────────────────────────────────────────
+
+export function getPaperPdfUrl(sessionId: string): string {
+  return `/api/sessions/${sessionId}/paper/pdf`
+}
+
 // ── Health ────────────────────────────────────────────
 
 export function fetchHealth(): Promise<{ status: string; cwd: string }> {

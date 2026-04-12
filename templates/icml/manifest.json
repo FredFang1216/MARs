@@ -6,13 +6,13 @@
   "description": "International Conference on Machine Learning. Top ML venue with 8-page limit.",
   "template_files": {
     "main": "main.tex",
-    "style": "icml2024.sty",
+    "style": "icml2026.sty",
     "makefile": "Makefile"
   },
   "compilation": {
     "engine": "pdflatex",
     "bibtex": "bibtex",
     "sequence": ["pdflatex", "bibtex", "pdflatex", "pdflatex"],
-    "extra_packages": ["icml2024"]
+    "extra_packages": ["icml2026"]
   }
 }

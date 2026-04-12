@@ -18,6 +18,10 @@ import { EvidencePoolCompressor } from '../evidence-pool-compressor'
 import type { DKPLoader } from '../domain-knowledge/loader'
 import type { ResearchStance } from '../types'
 import { summarizeExperimentPlan } from '../experiments/plan-generator'
+import {
+  buildExperimentFeedbackContext,
+  type RetreatSignal,
+} from '../experiments/experiment-evaluator'
 
 export class PromptAssembler {
   private graph: ClaimGraph
@@ -130,6 +134,7 @@ export class PromptAssembler {
   assembleArbiter(
     builderOutput: BuilderOutput,
     skepticOutput: SkepticOutput,
+    retreatSignals?: RetreatSignal[],
   ): string {
     const budget = allocateTokenBudget(this.graph.claimCount, false)
     const focusIds = this.focusSelector.selectForArbiter(
@@ -151,6 +156,7 @@ export class PromptAssembler {
         '## Skeptic Challenges\n' + this.summarizeSkeptic(skepticOutput, 1500),
         buildL0(this.graph, this.pool, this.state.stability),
         buildL2(this.graph, focusIds, this.pool, budget.l2FocusSubgraph),
+        this.buildExperimentFeedbackSection(retreatSignals),
         this.buildExperimentPlanContext(),
         this.buildBudgetContext(),
         this.buildConvergenceContext(),
@@ -400,6 +406,43 @@ ${claimLines}`
     )
 
     return truncateToTokens(sections.join('\n'), budgetTokens)
+  }
+
+  /**
+   * Build experiment feedback context for the Arbiter, including recent evaluations,
+   * stagnant claims, and any pending retreat signals.
+   */
+  private buildExperimentFeedbackSection(retreatSignals?: RetreatSignal[]): string {
+    const feedback = this.state.experiment_feedback
+    const hasEvaluations = feedback && feedback.evaluations.length > 0
+    const hasRetreatSignals = retreatSignals && retreatSignals.length > 0
+    if (!hasEvaluations && !hasRetreatSignals) return ''
+
+    const parts: string[] = []
+
+    // Core feedback from evaluations
+    if (feedback && feedback.evaluations.length > 0) {
+      const ctx = buildExperimentFeedbackContext(
+        feedback.evaluations,
+        feedback.claim_histories,
+      )
+      if (ctx) parts.push(ctx)
+    }
+
+    // Append pending retreat signals as urgent directives
+    if (retreatSignals && retreatSignals.length > 0) {
+      parts.push('\n### Active Retreat Signals')
+      for (const sig of retreatSignals) {
+        const action = sig.suggested_action === 'reformulate_or_demote'
+          ? 'You SHOULD reformulate or demote this claim. Do NOT schedule another experiment without first modifying it.'
+          : 'Consider revising the experimental approach or contracting the claim to a weaker layer.'
+        parts.push(
+          `- **${sig.signal.toUpperCase()}** [${sig.claim_id.slice(0, 12)}]: ${sig.consecutive_failures} consecutive failures. ${action}\n  Reason: ${sig.reason}`,
+        )
+      }
+    }
+
+    return parts.join('\n')
   }
 
   private buildExperimentPlanContext(): string {

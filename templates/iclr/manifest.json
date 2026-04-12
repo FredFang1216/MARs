@@ -1,18 +1,19 @@
 {
-  "id": "neurips",
-  "name": "NeurIPS 2026",
+  "id": "iclr",
+  "name": "ICLR 2026",
   "venue_type": "conference",
   "field": "machine-learning",
-  "description": "Conference on Neural Information Processing Systems. Premier ML venue with 9-page limit.",
+  "description": "International Conference on Learning Representations. Top ML venue with 10-page limit.",
   "template_files": {
     "main": "main.tex",
-    "style": "neurips_2026.sty",
+    "style": "iclr2026_conference.sty",
+    "math_commands": "math_commands.tex",
     "makefile": "Makefile"
   },
   "compilation": {
     "engine": "pdflatex",
     "bibtex": "bibtex",
     "sequence": ["pdflatex", "bibtex", "pdflatex", "pdflatex"],
-    "extra_packages": ["neurips_2026"]
+    "extra_packages": ["iclr2026_conference"]
   }
 }

@@ -19,6 +19,14 @@
       "path": "icml"
     },
     {
+      "id": "iclr",
+      "name": "ICLR 2026",
+      "aliases": ["iclr", "iclr2026"],
+      "venue_type": "conference",
+      "field": "machine-learning",
+      "path": "iclr"
+    },
+    {
       "id": "aaai",
       "name": "AAAI 2026",
       "aliases": ["aaai", "aaai2026"],

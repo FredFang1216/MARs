@@ -268,13 +268,22 @@ export class OrchestratorManager {
 
   /**
    * Resolve a pending decision.
+   * When choice is 'edit', editedDecision contains the user's modifications.
+   * Currently the orchestrator treats 'edit' as a re-run signal; the edited
+   * payload is stored for future use when the orchestrator supports it.
    */
   resolveDecision(
     sessionId: string,
     choice: 'approve' | 'edit' | 'skip',
+    editedDecision?: { context?: string; delegate_to?: string; targets_claim?: string },
   ): void {
     const entry = this.running.get(sessionId)
     if (!entry?.decisionResolver) return
+
+    // Store edited decision for potential future use
+    if (choice === 'edit' && editedDecision) {
+      (entry as any)._lastEditedDecision = editedDecision
+    }
 
     entry.decisionResolver(choice)
     entry.decisionResolver = null

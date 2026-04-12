@@ -95,6 +95,12 @@ import type {
 import { summarizeExperimentPlan } from './experiments/plan-generator'
 import { PlanExecutor } from './experiments/plan-executor'
 import { ExperimentEvidenceConverter } from './experiments/evidence-converter'
+import {
+  evaluateExperiment,
+  buildClaimExperimentHistory,
+  type ExperimentEvaluation,
+  type RetreatSignal,
+} from './experiments/experiment-evaluator'
 
 // ── Types ────────────────────────────────────────────────
 
@@ -316,6 +322,7 @@ export class Orchestrator {
   private evidenceConverter: ExperimentEvidenceConverter
   private lastCreatedExperimentId: string | null = null
   private lastCreatedExperimentDir: string | null = null
+  private pendingRetreatSignals: RetreatSignal[] = []
   private lastEffortLevels: {
     builder: EffortLevel
     skeptic: EffortLevel
@@ -887,10 +894,11 @@ export class Orchestrator {
           this.linkEvidenceToClaims(prEvidence, graph, pool, [])
         }
 
-        // 10.3. Process experiment results: update log, extract metrics evidence
+        // 10.3. Process experiment results: update log, extract metrics evidence, evaluate
+        let experimentEvaluation: ExperimentEvaluation | null = null
         if (decision.action.delegate_to === 'experiment-runner') {
           const durationSec = (Date.now() - execStartMs) / 1000
-          await this.processExperimentResult(
+          experimentEvaluation = await this.processExperimentResult(
             result,
             decision,
             pool,
@@ -1008,6 +1016,7 @@ export class Orchestrator {
             this.summarizeSkepticForTrajectory(skepticOutput),
           arbiter_decision_summary: arbiterOutput.overall_assessment,
           effort_levels: this.lastEffortLevels ?? undefined,
+          experiment_evaluation: experimentEvaluation ?? undefined,
         })
         // Reset effort tracking for next cycle
         this.lastEffortLevels = null
@@ -1221,9 +1230,14 @@ export class Orchestrator {
     builderOutput: BuilderOutput,
     skepticOutput: SkepticOutput,
   ): Promise<ArbiterOutput> {
+    // Pass pending retreat signals to the prompt assembler
+    const retreatSignals = this.pendingRetreatSignals.length > 0
+      ? [...this.pendingRetreatSignals]
+      : undefined
     const prompt = this.promptAssembler.assembleArbiter(
       builderOutput,
       skepticOutput,
+      retreatSignals,
     )
 
     const { effort, reasons } = determineEffort(
@@ -1242,6 +1256,10 @@ export class Orchestrator {
       reasoning_effort: effort,
       messages: [{ role: 'user', content: prompt }],
     })
+
+    // Drain signals only after successful Arbiter call — if LLM fails,
+    // signals are preserved for the next attempt
+    this.pendingRetreatSignals = []
 
     this.recordOrchestratorCost(response.cost_usd ?? 0, 'arbiter')
     return parseTripleRoleOutput<ArbiterOutput>(response.text, 'arbiter')
@@ -1406,11 +1424,17 @@ export class Orchestrator {
 
       const decision = canAdmit(claimId, graph, pool, this.researchStance)
       if (decision.admit) {
-        graph.updateClaim(claimId, { phase: 'admitted' })
-        admitted++
-        this.callbacks.onProgress(
-          `Post-evidence admission: ${claimId} now admitted`,
-        )
+        const ladderResult = graph.updateClaim(claimId, { phase: 'admitted' })
+        if (ladderResult.admitted) {
+          admitted++
+          this.callbacks.onProgress(
+            `Post-evidence admission: ${claimId} now admitted`,
+          )
+        } else {
+          this.callbacks.onProgress(
+            `Post-evidence retry: ${claimId} still blocked by evidence ladder: ${ladderResult.gap}`,
+          )
+        }
       }
     }
     return admitted
@@ -3128,9 +3152,9 @@ Respond with ONLY valid JSON (no markdown fences):
     pool: EvidencePoolManager,
     durationSeconds?: number,
     fallbackExperimentId?: string | null,
-  ): Promise<void> {
+  ): Promise<ExperimentEvaluation | null> {
     const experimentId = this.findExperimentId(result, fallbackExperimentId)
-    if (!experimentId) return
+    if (!experimentId) return null
 
     // a) Update experiment-log status
     await this.experimentLog.updateStatus(experimentId, {
@@ -3154,13 +3178,21 @@ Respond with ONLY valid JSON (no markdown fences):
 
     // b) Read metrics.json and convert to evidence via ExperimentEvidenceConverter
     const metrics = this.experimentResults.readMetrics(experimentId)
+    const targetClaimId = decision.action.targets_claim || null
+
+    // Default conversion for when no metrics are available
+    let conversion = {
+      evidenceIds: [] as string[],
+      successCriteriaMet: null as boolean | null,
+      confidenceDelta: 0,
+      summary: 'No metrics produced',
+    }
 
     if (metrics) {
       const graph = ClaimGraph.fromJSON(this.state.claimGraph)
-      const targetClaimId = decision.action.targets_claim || null
 
       // Convert metrics → evidence + evaluate success criteria + update confidence
-      const conversion = this.evidenceConverter.convert(
+      conversion = this.evidenceConverter.convert(
         metrics,
         experimentId,
         targetClaimId,
@@ -3177,6 +3209,99 @@ Respond with ONLY valid JSON (no markdown fences):
         claimGraph: graph.toJSON(),
         evidencePool: pool.pool,
       }
+    }
+
+    // c) Evaluate experiment and produce structured assessment
+    const evaluation = evaluateExperiment({
+      experimentId,
+      targetClaimId,
+      metrics: metrics ?? null,
+      conversion,
+      experimentFailed: !result.success,
+    })
+
+    // d) Record evaluation in state
+    this.recordExperimentEvaluation(evaluation)
+
+    this.callbacks.onProgress(
+      `Evaluation: ${evaluation.recommended_route} (baseline=${evaluation.beats_baseline ?? 'N/A'}, failure=${evaluation.failure_mode})`,
+    )
+
+    // e) Handle retreat routing if experiment weakened a claim
+    if (evaluation.recommended_route === 'revise_claim' && evaluation.target_claim_id) {
+      this.handleClaimRetreat(evaluation)
+    }
+
+    return evaluation
+  }
+
+  /**
+   * Record an ExperimentEvaluation in state.experiment_feedback and update per-claim histories.
+   * Uses immutable pattern and caps stored evaluations to prevent unbounded growth.
+   */
+  private recordExperimentEvaluation(evaluation: ExperimentEvaluation): void {
+    const existing = this.state.experiment_feedback
+    const MAX_EVALUATIONS = 50
+    let evaluations = [...(existing?.evaluations ?? []), evaluation]
+    const truncated = evaluations.length > MAX_EVALUATIONS
+    if (truncated) {
+      evaluations = evaluations.slice(-MAX_EVALUATIONS)
+    }
+
+    let claim_histories = { ...(existing?.claim_histories ?? {}) }
+
+    if (truncated) {
+      // Rebuild ALL histories since old evaluations were evicted
+      for (const cid of Object.keys(claim_histories)) {
+        claim_histories[cid] = buildClaimExperimentHistory(cid, evaluations)
+      }
+    }
+
+    // Always rebuild history for the current target claim
+    if (evaluation.target_claim_id) {
+      claim_histories[evaluation.target_claim_id] =
+        buildClaimExperimentHistory(evaluation.target_claim_id, evaluations)
+    }
+
+    this.state = {
+      ...this.state,
+      experiment_feedback: { evaluations, claim_histories },
+    }
+  }
+
+  /**
+   * Generate retreat signals when experiments weaken a claim.
+   * Signals are injected into the next Arbiter prompt — the evaluator never
+   * directly modifies claims (that's the Arbiter's job).
+   */
+  private handleClaimRetreat(evaluation: ExperimentEvaluation): void {
+    const claimId = evaluation.target_claim_id!
+    const history = this.state.experiment_feedback?.claim_histories?.[claimId]
+
+    if (history?.stagnant) {
+      // 2+ consecutive failures → strongly recommend reformulation
+      this.pendingRetreatSignals.push({
+        claim_id: claimId,
+        signal: 'stagnant_retreat',
+        consecutive_failures: history.consecutive_failures,
+        reason: evaluation.reason,
+        suggested_action: 'reformulate_or_demote',
+      })
+      this.callbacks.onProgress(
+        `RETREAT: Claim ${claimId.slice(0, 12)} stagnant after ${history.consecutive_failures} failures — suggesting reformulation`,
+      )
+    } else {
+      // First failure → inform arbiter
+      this.pendingRetreatSignals.push({
+        claim_id: claimId,
+        signal: 'experiment_weakened',
+        consecutive_failures: history?.consecutive_failures ?? 1,
+        reason: evaluation.reason,
+        suggested_action: 'revise_approach',
+      })
+      this.callbacks.onProgress(
+        `FEEDBACK: Experiment weakened claim ${claimId.slice(0, 12)} — arbiter will be informed`,
+      )
     }
   }
 

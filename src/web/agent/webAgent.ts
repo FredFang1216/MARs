@@ -20,6 +20,11 @@ import { OrchestratorManager } from '../orchestrator/manager'
 import { CreationManager } from '../creation/manager'
 import { ChatManager } from '../chat/manager'
 import { validateAndNormalizeProposal } from '../../paper/proposal/types'
+import { DeepResearchEngine } from '../../paper/deep-research/index'
+import { ProposalGenerator, selectBestProposal } from '../../paper/proposal/index'
+import { WritingPipeline } from '../../paper/writing/pipeline'
+import { TemplateResolver } from '../../paper/writing/template-resolver'
+import { probeSystem } from '../../paper/system-probe'
 
 export interface WebAgentOptions {
   cwd: string
@@ -172,12 +177,16 @@ export class WebAgent {
       'orchestrator/decide',
       async (params: unknown) => {
         this.requireSession()
-        const { choice } = params as { choice: 'approve' | 'edit' | 'skip' }
+        const { choice, editedDecision } = params as {
+          choice: 'approve' | 'edit' | 'skip'
+          editedDecision?: { context?: string; delegate_to?: string; targets_claim?: string }
+        }
         if (!choice) throw new JsonRpcError(-32602, 'choice is required')
 
         this.orchestratorManager.resolveDecision(
           this.session!.sessionId,
           choice,
+          editedDecision,
         )
         return { status: 'resolved' }
       },
@@ -380,6 +389,256 @@ export class WebAgent {
         return { creationId }
       },
     )
+
+    // ── Deep Research (standalone) ────────────────────────
+
+    this.peer.registerMethod(
+      'research/deep-research',
+      async (params: unknown) => {
+        this.requireSession()
+        const opts = (params ?? {}) as {
+          depth?: 'quick' | 'standard' | 'thorough'
+          continue_from?: string
+          max_papers?: number
+        }
+        const projectDir = this.session!.projectDir
+        const state = loadResearchState(projectDir)
+        const topic = state?.proposal?.title ?? 'research'
+
+        const engine = new DeepResearchEngine(projectDir, {
+          depth: opts.depth ?? 'standard',
+          continue_from: opts.continue_from,
+          max_papers: opts.max_papers,
+        })
+
+        const emit = (msg: string) => {
+          this.peer.sendNotification('research/progress', {
+            sessionId: this.session!.sessionId,
+            message: `[deep-research] ${msg}`,
+          })
+        }
+
+        const result = await engine.run(topic, emit)
+        return {
+          papers_found: result.papers_found,
+          papers_acquired: result.papers_acquired,
+          survey_path: result.survey_path,
+          gaps_path: result.gaps_path,
+        }
+      },
+    )
+
+    // ── Proposal Generation (standalone) ──────────────────
+
+    this.peer.registerMethod(
+      'research/generate-proposals',
+      async (params: unknown) => {
+        this.requireSession()
+        const opts = (params ?? {}) as {
+          count?: number
+          focus?: string
+        }
+        const projectDir = this.session!.projectDir
+        const { extractModelId } = await import('../../paper/agent-dispatch')
+        const { DEFAULT_MODEL_ASSIGNMENTS } = await import('../../paper/types')
+        const modelId = extractModelId(DEFAULT_MODEL_ASSIGNMENTS.research)
+
+        const generator = new ProposalGenerator(modelId)
+        const proposals = await generator.generate({
+          count: opts.count ?? 3,
+          research_dir: projectDir,
+          focus: opts.focus,
+        })
+
+        return { proposals }
+      },
+    )
+
+    // ── Writing Pipeline ─────────────────────────────────
+
+    this.peer.registerMethod(
+      'research/write-paper',
+      async (params: unknown) => {
+        this.requireSession()
+        const opts = (params ?? {}) as { templateId?: string }
+        const projectDir = this.session!.projectDir
+        const state = loadResearchState(projectDir)
+        if (!state) throw new JsonRpcError(-32000, 'No research state found')
+
+        const sessionId = this.session!.sessionId
+        const pipeline = new WritingPipeline({
+          projectDir,
+          state,
+          templateId: opts.templateId,
+          onProgress: (phase, message) => {
+            this.peer.sendNotification('research/progress', {
+              sessionId,
+              message: `[write/${phase}] ${message}`,
+            })
+          },
+        })
+
+        const result = await pipeline.run()
+        return {
+          success: result.success,
+          pdfPath: result.pdfPath,
+          warnings: result.warnings,
+          phases_completed: result.phases_completed,
+        }
+      },
+    )
+
+    // ── Multi-Model Review ───────────────────────────────
+
+    this.peer.registerMethod(
+      'research/review',
+      async (params: unknown) => {
+        this.requireSession()
+        const opts = (params ?? {}) as {
+          strength?: 'light' | 'standard' | 'thorough' | 'brutal'
+          num_reviewers?: number
+        }
+        const projectDir = this.session!.projectDir
+        const sessionId = this.session!.sessionId
+        const state = loadResearchState(projectDir)
+        if (!state) throw new JsonRpcError(-32000, 'No research state found')
+
+        // Find the compiled paper text
+        const { readFileSync, existsSync } = await import('fs')
+        const { join } = await import('path')
+        const paperDir = join(projectDir, 'paper')
+        const mainTexPath = join(paperDir, 'main.tex')
+        if (!existsSync(mainTexPath)) {
+          throw new JsonRpcError(-32000, 'No paper found. Run write-paper first.')
+        }
+
+        // Collect all tex content
+        const mainTex = readFileSync(mainTexPath, 'utf-8')
+        const sectionsDir = join(paperDir, 'sections')
+        let paperText = mainTex
+        if (existsSync(sectionsDir)) {
+          const { readdirSync } = await import('fs')
+          for (const f of readdirSync(sectionsDir)) {
+            if (f.endsWith('.tex')) {
+              paperText += '\n\n' + readFileSync(join(sectionsDir, f), 'utf-8')
+            }
+          }
+        }
+
+        const { PaperReviewer } = await import('../../paper/review/reviewer')
+        const { MetaReviewer } = await import('../../paper/review/meta-reviewer')
+        const { DEFAULT_MODEL_ASSIGNMENTS } = await import('../../paper/types')
+        const { extractModelId } = await import('../../paper/agent-dispatch')
+
+        const numReviewers = Math.min(opts.num_reviewers ?? 3, 5)
+        const reviewModel = extractModelId(DEFAULT_MODEL_ASSIGNMENTS.review)
+
+        this.peer.sendNotification('research/progress', {
+          sessionId,
+          message: `[review] Starting ${numReviewers}-reviewer review...`,
+        })
+
+        // Run reviews in parallel
+        const reviewers = Array.from({ length: numReviewers }, (_, i) =>
+          new PaperReviewer(reviewModel, `reviewer-${i + 1}`),
+        )
+        const config = { strength: opts.strength ?? 'standard' }
+        const reports = await Promise.all(
+          reviewers.map(r => r.review(paperText, config)),
+        )
+
+        this.peer.sendNotification('research/progress', {
+          sessionId,
+          message: `[review] All ${numReviewers} reviews complete. Synthesizing meta-review...`,
+        })
+
+        // Meta-review
+        const metaReviewer = new MetaReviewer(reviewModel)
+        const metaReview = await metaReviewer.synthesize(reports, config)
+
+        return {
+          reviews: reports,
+          meta_review: metaReview,
+        }
+      },
+    )
+
+    // ── Delivery Packaging ───────────────────────────────
+
+    this.peer.registerMethod(
+      'research/deliver',
+      async (params: unknown) => {
+        this.requireSession()
+        const opts = (params ?? {}) as {
+          format?: 'arxiv' | 'camera-ready' | 'standard'
+          include_code?: boolean
+        }
+        const projectDir = this.session!.projectDir
+        const { DeliveryPackager } = await import('../../paper/delivery/packager')
+        const packager = new DeliveryPackager(projectDir)
+        const manifest = await packager.package({
+          format: opts.format ?? 'standard',
+          include_code: opts.include_code ?? false,
+        })
+        return manifest
+      },
+    )
+
+    // ── Templates ────────────────────────────────────────
+
+    this.peer.registerMethod('templates/list', () => {
+      const resolver = new TemplateResolver()
+      return resolver.listTemplates()
+    })
+
+    this.peer.registerMethod(
+      'templates/resolve',
+      (params: unknown) => {
+        const { templateId } = params as { templateId: string }
+        if (!templateId) throw new JsonRpcError(-32602, 'templateId is required')
+        const resolver = new TemplateResolver()
+        const resolved = resolver.resolve(templateId)
+        return {
+          manifest: resolved.manifest,
+          constraints: resolved.constraints,
+        }
+      },
+    )
+
+    // ── System Check ─────────────────────────────────────
+
+    this.peer.registerMethod('system/check', async () => {
+      return probeSystem()
+    })
+
+    // ── Next Action Recommendation ───────────────────────
+
+    this.peer.registerMethod('research/next-action', async () => {
+      this.requireSession()
+      const projectDir = this.session!.projectDir
+      const state = loadResearchState(projectDir)
+      if (!state) throw new JsonRpcError(-32000, 'No research state found')
+
+      const { chatCompletion } = await import('../../paper/llm-client')
+      const { DEFAULT_MODEL_ASSIGNMENTS } = await import('../../paper/types')
+      const { buildStateContext } = await import('../../paper/research-state')
+
+      const context = buildStateContext(state)
+      const response = await chatCompletion({
+        modelSpec: DEFAULT_MODEL_ASSIGNMENTS.quick,
+        max_tokens: 1024,
+        messages: [{
+          role: 'user',
+          content: `Based on this research state, what is the single most impactful next action?\n\n${context}\n\nRespond in JSON: {"action": "description", "delegate_to": "agent-name", "targets_claim": "claim-id or null", "reasoning": "why this action", "risk": "what could go wrong"}`,
+        }],
+      })
+
+      try {
+        return JSON.parse(response.text)
+      } catch {
+        return { action: response.text, delegate_to: 'unknown', reasoning: 'Could not parse structured response' }
+      }
+    })
   }
 
   private requireSession(): void {

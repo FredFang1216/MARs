@@ -135,6 +135,12 @@ export function refreshScoreboard(projectDir: string, state: ResearchState): Sco
     }
   }
 
+  // Reset counts before re-scanning trajectory (prevents unbounded accumulation)
+  for (const method of methods) {
+    method.run_count = 0
+    method.best_result = undefined
+  }
+
   // Count experiment runs per method from trajectory
   for (const entry of state.trajectory) {
     if (entry.action_type.includes('experiment') && entry.outcome) {
@@ -145,6 +151,21 @@ export function refreshScoreboard(projectDir: string, state: ResearchState): Sco
             method.best_result = entry.outcome.slice(0, 200)
           }
         }
+      }
+    }
+  }
+
+  // Mark methods as abandoned if ALL their supporting claims are stagnant
+  const claimHistories = state.experiment_feedback?.claim_histories
+  if (claimHistories) {
+    for (const method of methods) {
+      if (method.status === 'abandoned' || method.status === 'superseded') continue
+      if (method.supporting_claims.length === 0) continue
+      const allStagnant = method.supporting_claims.every(
+        cid => claimHistories[cid]?.stagnant,
+      )
+      if (allStagnant) {
+        method.status = 'abandoned'
       }
     }
   }

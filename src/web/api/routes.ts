@@ -1,9 +1,13 @@
 import { existsSync, readFileSync, readdirSync } from 'fs'
 import { join, resolve } from 'path'
 import { loadResearchState } from '../../paper/research-state'
+import { loadResearchMap, loadStagePlan, loadChecklist } from '../../paper/research-plan'
+import { loadRecentDecisions } from '../../paper/decision-artifact'
+import { loadScoreboard } from '../../paper/method-scoreboard'
 import { loadConfig, saveConfig, CONFIG_PATH } from '../../paper/config-io'
 import { invalidateCaches as invalidateLLMCaches } from '../../paper/llm-client'
 import { ExperimentLogManager } from '../../paper/experiments/experiment-log'
+import { ExperimentPromoter } from '../../paper/experiments/promoter'
 import { loadSessionState } from '../../paper/session-state'
 import { listSessions } from '../../paper/session'
 import {
@@ -11,6 +15,9 @@ import {
   addPaperToAcquired,
   removePaperFromAcquired,
 } from '../../paper/literature-db'
+import { TemplateResolver } from '../../paper/writing/template-resolver'
+import { probeSystem } from '../../paper/system-probe'
+import { FragmentStore } from '../../paper/fragment-store'
 
 const SESSIONS_DIR_NAME = '.claude-paper-research'
 
@@ -241,6 +248,31 @@ export async function handleApiRoute(req: Request, cwd: string): Promise<Respons
       return json(state.budget)
     }
 
+    // ── Research Infrastructure ────────────────────────────
+
+    if (subpath === 'research-plan' && method === 'GET') {
+      const researchMap = loadResearchMap(sessionDir)
+      const stagePlan = loadStagePlan(sessionDir)
+      const checklist = loadChecklist(sessionDir)
+      if (!researchMap && !stagePlan && !checklist) {
+        return error('No research plan found', 404)
+      }
+      return json({ researchMap, stagePlan, checklist })
+    }
+
+    if (subpath === 'decisions' && method === 'GET') {
+      const countParam = new URL(req.url).searchParams.get('count')
+      const count = countParam ? Math.min(Math.max(parseInt(countParam, 10) || 10, 1), 50) : 10
+      const decisions = loadRecentDecisions(sessionDir, count)
+      return json(decisions)
+    }
+
+    if (subpath === 'method-scoreboard' && method === 'GET') {
+      const scoreboard = loadScoreboard(sessionDir)
+      if (!scoreboard) return error('No method scoreboard found', 404)
+      return json(scoreboard)
+    }
+
     if (subpath === 'artifacts' && method === 'GET') {
       if (!state) return error('No research state found', 404)
       return json(state.artifacts)
@@ -411,6 +443,85 @@ export async function handleApiRoute(req: Request, cwd: string): Promise<Respons
       })
     }
 
+    // ── Unified Status ──────────────────────────────────
+    if (subpath === 'status' && method === 'GET') {
+      const state = loadResearchState(sessionDir)
+      if (!state) return error('No research state found', 404)
+      const graph = state.claimGraph
+      const claims = graph?.claims ?? []
+      const admitted = claims.filter((c: any) => c.phase === 'admitted').length
+      const proposed = claims.filter((c: any) => c.phase === 'proposed').length
+      const investigating = claims.filter((c: any) => c.phase === 'under_investigation').length
+      const stability = state.stability
+      const budget = state.budget
+      const evidencePool = state.evidencePool
+      const totalEvidence = (evidencePool?.grounded?.length ?? 0) + (evidencePool?.derived?.length ?? 0)
+      const proofCount = state.theory?.proofs?.length ?? 0
+      const artifactCount = state.artifacts?.entries?.length ?? 0
+
+      return json({
+        topic: state.proposal?.title ?? 'Unknown',
+        paper_type: state.paper_type,
+        cycle: state.orchestrator_cycle_count,
+        claims: {
+          total: claims.length,
+          admitted,
+          proposed,
+          investigating,
+          rejected: claims.filter((c: any) => c.phase === 'rejected').length,
+          reformulated: claims.filter((c: any) => c.phase === 'reformulated').length,
+        },
+        convergence: stability?.convergenceScore ?? 0,
+        paper_readiness: stability?.paperReadiness ?? 'not_ready',
+        evidence: {
+          total: totalEvidence,
+          grounded: evidencePool?.grounded?.length ?? 0,
+          derived: evidencePool?.derived?.length ?? 0,
+        },
+        budget: {
+          total_usd: budget?.total_usd ?? 0,
+          remaining_usd: budget?.remaining_usd ?? 0,
+          spent_usd: (budget?.total_usd ?? 0) - (budget?.remaining_usd ?? 0),
+        },
+        proofs: proofCount,
+        artifacts: artifactCount,
+        has_pdf: !!state.artifacts?.compiled_pdf,
+        experiment_feedback: state.experiment_feedback ? {
+          total_evaluations: state.experiment_feedback.evaluations.length,
+          stagnant_claims: Object.values(state.experiment_feedback.claim_histories)
+            .filter((h: any) => h.stagnant).length,
+        } : null,
+      })
+    }
+
+    // ── Fragments ────────────────────────────────────────
+    if (subpath === 'fragments' && method === 'GET') {
+      const store = new FragmentStore(sessionDir)
+      return json(store.list())
+    }
+
+    const fragMatch = subpath.match(/^fragments\/(.+)$/)
+    if (fragMatch && method === 'GET') {
+      const fragId = fragMatch[1]
+      const store = new FragmentStore(sessionDir)
+      const frag = store.get(fragId)
+      if (!frag) return error('Fragment not found', 404)
+      return json(frag)
+    }
+
+    // ── Experiment Promote ─────────────────────────────
+    const promoteMatch = subpath.match(/^experiments\/([^/]+)\/promote$/)
+    if (promoteMatch && method === 'POST') {
+      const probeId = promoteMatch[1]
+      try {
+        const promoter = new ExperimentPromoter(sessionDir)
+        const result = await promoter.promoteToRun(probeId)
+        return json(result)
+      } catch (e: any) {
+        return error(e.message)
+      }
+    }
+
     return error(`Unknown session endpoint: ${subpath}`, 404)
   }
 
@@ -443,6 +554,39 @@ export async function handleApiRoute(req: Request, cwd: string): Promise<Respons
 
   if (path === '/api/config' && method === 'PUT') {
     return handleConfigUpdate(req)
+  }
+
+  // ── Templates ──────────────────────────────────────
+
+  if (path === '/api/templates' && method === 'GET') {
+    const resolver = new TemplateResolver()
+    const templates = resolver.listTemplates()
+    return json(templates)
+  }
+
+  if (path.match(/^\/api\/templates\/([^/]+)$/) && method === 'GET') {
+    const templateId = path.split('/').pop()!
+    const resolver = new TemplateResolver()
+    try {
+      const resolved = resolver.resolve(templateId)
+      return json({
+        manifest: resolved.manifest,
+        constraints: resolved.constraints,
+      })
+    } catch (e: any) {
+      return error(e.message, 404)
+    }
+  }
+
+  // ── System Check ─────────────────────────────────
+
+  if (path === '/api/system-check' && method === 'GET') {
+    try {
+      const caps = await probeSystem()
+      return json(caps)
+    } catch (e: any) {
+      return error(`System probe failed: ${e.message}`, 500)
+    }
   }
 
   // ── Health ──────────────────────────────────────────
