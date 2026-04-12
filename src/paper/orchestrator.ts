@@ -37,6 +37,9 @@ import {
   getAdmittedClaims,
 } from './research-state'
 import { ClaimGraph, type ClaimInput } from './claim-graph/index'
+import { syncPlanFromState } from './research-plan'
+import { createDecisionArtifact, recordDecision } from './decision-artifact'
+import { refreshScoreboard } from './method-scoreboard'
 import type {
   ClaimType,
   ClaimPhase,
@@ -551,6 +554,9 @@ export class Orchestrator {
 
         // 5. Convert to OrchestratorDecision for UI compat
         const decision = this.arbiterToDecision(arbiterOutput)
+
+        // 5.1. Record decision artifact for audit trail (P3)
+        this.recordDecisionArtifact(decision)
 
         // 5.5. Track consecutive redesign decisions
         if (decision.action.type.toLowerCase().includes('redesign')) {
@@ -1335,8 +1341,16 @@ export class Orchestrator {
             this.researchStance,
           )
           if (decision.admit) {
-            graph.updateClaim(update.claim_id, { phase: 'admitted' })
-            counts.admitted++
+            const ladderResult = graph.updateClaim(update.claim_id, { phase: 'admitted' })
+            if (ladderResult.admitted) {
+              counts.admitted++
+            } else {
+              // Evidence ladder blocked admission — claim needs stronger evidence
+              this.callbacks.onProgress(
+                `Evidence ladder blocked admission of ${update.claim_id}: ${ladderResult.gap}`,
+              )
+              blockedAdmitIds.push(update.claim_id)
+            }
           } else {
             this.callbacks.onProgress(
               `Admission gate blocked ${update.claim_id}: ${decision.reason} (will retry after evidence)`,
@@ -3861,9 +3875,43 @@ and fix errors (up to 5 retries). Report the final PDF path.`,
   }
 
   /**
-   * Save state to disk.
+   * Save state to disk and sync durable research infrastructure.
    */
   private checkpoint(): void {
     saveResearchState(this.projectDir, this.state)
+
+    // Sync three-layer research plan (P2)
+    try {
+      syncPlanFromState(this.projectDir, this.state)
+    } catch {
+      // Non-critical — plan sync failure should not block research
+    }
+
+    // Refresh method scoreboard (P4)
+    try {
+      refreshScoreboard(this.projectDir, this.state)
+    } catch {
+      // Non-critical
+    }
+  }
+
+  /**
+   * Record a decision artifact for audit trail (P3).
+   */
+  private recordDecisionArtifact(decision: OrchestratorDecision): void {
+    try {
+      const artifact = createDecisionArtifact({
+        cycle: this.state.orchestrator_cycle_count,
+        action: decision.action,
+        reasoning: decision.reasoning,
+        state: {
+          stability: this.state.stability,
+          budget: this.state.budget,
+        },
+      })
+      recordDecision(this.projectDir, artifact)
+    } catch {
+      // Non-critical — decision recording failure should not block research
+    }
   }
 }

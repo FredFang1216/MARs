@@ -15,9 +15,10 @@ import type {
   RecentChangeResult,
   ClaimGraphStatistics,
 } from './types'
-import { EPISTEMIC_LAYER_ORDER } from './types'
+import { EPISTEMIC_LAYER_ORDER, computeEvidenceTier, meetsAdmissionRequirement } from './types'
 
-export { EPISTEMIC_LAYER_ORDER } from './types'
+export { EPISTEMIC_LAYER_ORDER, computeEvidenceTier, meetsAdmissionRequirement } from './types'
+export type { EvidenceTier } from './types'
 export type {
   Claim,
   ClaimEdge,
@@ -65,19 +66,51 @@ export class ClaimGraph {
       last_assessed_at: now,
       assessment_history: [],
     }
+    // Compute evidence tier on creation
+    claim.strength = {
+      ...claim.strength,
+      evidenceTier: computeEvidenceTier(claim),
+    }
     this.claims.set(id, claim)
     return id
   }
 
-  updateClaim(claimId: string, updates: Partial<Omit<Claim, 'id'>>): void {
+  /**
+   * Update a claim. If transitioning to 'admitted', the evidence ladder
+   * gate is checked — theorem/novelty claims require 'solid' tier.
+   * Returns { admitted: boolean, gap?: string } for callers to act on.
+   */
+  updateClaim(claimId: string, updates: Partial<Omit<Claim, 'id'>>): { admitted: boolean; gap?: string } {
     const existing = this.claims.get(claimId)
     if (!existing) throw new Error(`Claim not found: ${claimId}`)
-    this.claims.set(claimId, {
+
+    const merged: Claim = {
       ...existing,
       ...updates,
-      id: claimId, // preserve id
+      id: claimId,
       last_assessed_at: new Date().toISOString(),
-    })
+    }
+
+    // Recompute evidence tier
+    merged.strength = {
+      ...merged.strength,
+      evidenceTier: computeEvidenceTier(merged),
+    }
+
+    // Evidence ladder gate: block admission if tier insufficient
+    const isAdmitting = updates.phase === 'admitted' && existing.phase !== 'admitted'
+    if (isAdmitting) {
+      const check = meetsAdmissionRequirement(merged)
+      if (!check.meets) {
+        // Downgrade to under_investigation instead of admitting
+        merged.phase = 'under_investigation'
+        this.claims.set(claimId, merged)
+        return { admitted: false, gap: check.gap ?? undefined }
+      }
+    }
+
+    this.claims.set(claimId, merged)
+    return { admitted: isAdmitting ? true : false }
   }
 
   removeClaim(claimId: string): void {

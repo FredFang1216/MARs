@@ -568,6 +568,24 @@ export async function executeDockerRun(
       return 'Error: Docker is not installed. Install from https://docs.docker.com/get-docker/'
     }
 
+    // Auto-upgrade base Python images to pre-built research image if available.
+    // This avoids wasting time on `pip install numpy torch` every run.
+    const RESEARCH_IMAGE = 'mars-research'
+    const UPGRADEABLE_IMAGES = new Set([
+      'python:3.11', 'python:3.11-slim', 'python:3.12', 'python:3.12-slim',
+      'python:3', 'python:latest', 'python:3.11-bookworm',
+    ])
+    let resolvedImage = image
+    if (UPGRADEABLE_IMAGES.has(image)) {
+      // Check if mars-research image exists locally
+      try {
+        const check = Bun.spawn(['docker', 'image', 'inspect', RESEARCH_IMAGE], { stdout: 'pipe', stderr: 'pipe' })
+        if ((await check.exited) === 0) {
+          resolvedImage = RESEARCH_IMAGE
+        }
+      } catch { /* fall through to original image */ }
+    }
+
     const network = (input.network as boolean) ?? false
     const memory = (input.memory as string) ?? '4g'
     const cpus = Math.min((input.cpus as number) ?? 2, 16)
@@ -650,7 +668,7 @@ export async function executeDockerRun(
     }
 
     // Image and command
-    args.push(image, 'sh', '-c', command)
+    args.push(resolvedImage, 'sh', '-c', command)
 
     const proc = Bun.spawn(args, {
       stdout: 'pipe',

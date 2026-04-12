@@ -23,7 +23,7 @@ import {
 } from './tools/tool-context'
 import { registry } from './tools/registry'
 import { registerAllTools } from './tools/bridge'
-import { runToolCalls, type ToolExecContext } from './tools'
+import { runToolCalls, applyAggregateResultBudget, type ToolExecContext } from './tools'
 import {
   executeWebSearch,
   executeWebFetch,
@@ -1548,6 +1548,46 @@ function summarizeToolResult(
 // ── Agent Execution (Multi-Turn Tool Loop) ──────────────
 
 const MAX_TOOL_ROUNDS = 20
+const MAX_TRUNCATION_RETRIES = 3
+
+// ── Microcompaction ─────────────────────────────────────
+// Keep only the last N rounds of tool results in full; older ones get
+// replaced with a short marker. This prevents context from growing
+// unboundedly across many tool rounds. Inspired by Claude Code's
+// time-based microcompact in microCompact.ts.
+
+const KEEP_RECENT_TOOL_ROUNDS = 3
+const TOOL_RESULT_MARKER = /^\[Tool: .+\]\n/
+
+/**
+ * Replace old tool-result messages with a compact summary.
+ * Tool-result messages are identified by starting with "[Tool: ...]".
+ * We keep the most recent `keep` such messages intact.
+ */
+function microcompactMessages(messages: UnifiedMessage[], keep: number): void {
+  // Find indices of tool-result user messages
+  const toolResultIndices: number[] = []
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'user' && TOOL_RESULT_MARKER.test(messages[i].content)) {
+      toolResultIndices.push(i)
+    }
+  }
+
+  // Clear all but the most recent `keep` tool-result messages
+  const toClear = toolResultIndices.slice(0, -keep || toolResultIndices.length)
+  for (const idx of toClear) {
+    const content = messages[idx].content
+    // Count how many tool results are in this message (separated by ---)
+    const toolCount = (content.match(/\[Tool: /g) || []).length
+    // Extract just the tool names for the marker
+    const names = (content.match(/\[Tool: ([^\]]+)\]/g) || [])
+      .map(m => m.replace(/\[Tool: |\]/g, ''))
+    messages[idx] = {
+      role: 'user',
+      content: `[${toolCount} tool result(s) cleared: ${names.join(', ')}]`,
+    }
+  }
+}
 
 /**
  * Execute an agent by loading its template and running a multi-turn
@@ -1664,8 +1704,14 @@ When you have finished, provide your final results in the following JSON format 
     let totalInputTokens = 0
     let totalOutputTokens = 0
     let finalText = ''
+    let truncationRetries = 0
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      // Microcompact: clear old tool results to keep context lean
+      if (round > 0) {
+        microcompactMessages(messages, KEEP_RECENT_TOOL_ROUNDS)
+      }
+
       const response = await chatCompletion({
         modelSpec,
         messages,
@@ -1683,11 +1729,59 @@ When you have finished, provide your final results in the following JSON format 
         finalText = finalText ? finalText + '\n' + response.text : response.text
       }
 
+      // ── Truncation recovery (inspired by Claude Code) ──────
+      // If finish_reason='length', the model was cut off mid-response.
+      // Tool calls may be incomplete/missing. Inject a continuation prompt
+      // and retry, up to MAX_TRUNCATION_RETRIES times.
+      if (response.stop_reason === 'max_tokens' || response.stop_reason === 'length') {
+        if (truncationRetries < MAX_TRUNCATION_RETRIES) {
+          truncationRetries++
+          if (onProgress) {
+            onProgress(`  ${agentName}: response truncated, continuing (${truncationRetries}/${MAX_TRUNCATION_RETRIES})...`)
+          }
+          messages.push({
+            role: 'assistant',
+            content: response.text ?? '',
+          })
+          messages.push({
+            role: 'user',
+            content: 'Your previous response was truncated by the output token limit. Resume directly from where you left off — no apology, no recap. If you were about to call tools, call them now. Break remaining work into smaller pieces.',
+          })
+          continue
+        }
+        // Exhausted retries — fall through to normal exit check
+      }
+
       // Check if we need to handle tool calls
       if (response.stop_reason !== 'tool_use' || !response.tool_calls?.length) {
+        // Detect "dangling intent": model says "Let me check..." or ends
+        // with ":" but didn't actually issue tool calls. Nudge it to continue.
+        const text = (response.text || '').trimEnd()
+        const danglingIntent = truncationRetries < MAX_TRUNCATION_RETRIES && text.length > 0 && (
+          /[:：]\s*$/.test(text) ||
+          /(?:let me|i'll|i will|now (?:let|check|look|search|read|fetch|download))\b[^.!?]*$/i.test(text)
+        )
+        if (danglingIntent) {
+          truncationRetries++
+          if (onProgress) {
+            onProgress(`  ${agentName}: dangling intent detected, nudging continuation (${truncationRetries}/${MAX_TRUNCATION_RETRIES})...`)
+          }
+          messages.push({
+            role: 'assistant',
+            content: text,
+          })
+          messages.push({
+            role: 'user',
+            content: 'You stopped mid-thought. Continue — call the tools you were about to use.',
+          })
+          continue
+        }
         // Agent is done
         break
       }
+
+      // Reset truncation counter on successful tool-use round
+      truncationRetries = 0
 
       // Execute tool calls — concurrent-safe tools run in parallel,
       // unsafe tools run serially (inspired by Claude Code's toolOrchestration).
@@ -1707,8 +1801,8 @@ When you have finished, provide your final results in the following JSON format 
       const toolCtx: ToolExecContext = { workingDir, signal: undefined }
       const toolResults = await runToolCalls(toolCalls, registry, toolCtx)
 
-      // Report results and build message parts
-      const toolResultParts: string[] = []
+      // Build raw result strings
+      const rawResults: { toolName: string; result: string }[] = []
       for (let i = 0; i < response.tool_calls.length; i++) {
         const tc = response.tool_calls[i]
         const resultData = typeof toolResults[i].data === 'string'
@@ -1720,8 +1814,19 @@ When you have finished, provide your final results in the following JSON format 
             onProgress(`  ${resultSummary}`)
           }
         }
-        toolResultParts.push(`[Tool: ${tc.name}]\n${resultData}`)
+        rawResults.push({ toolName: tc.name, result: resultData })
       }
+
+      // Apply aggregate result budget — persist oversized results to disk
+      const budgetedResults = applyAggregateResultBudget(
+        rawResults,
+        workingDir,
+      )
+
+      // Build final message parts with budgeted results
+      const toolResultParts = response.tool_calls.map(
+        (tc, i) => `[Tool: ${tc.name}]\n${budgetedResults[i]}`,
+      )
 
       // Append the assistant's response and tool results to the conversation
       // The unified API uses plain text messages, so we serialize tool results as text

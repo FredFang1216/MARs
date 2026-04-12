@@ -1,0 +1,31 @@
+# Pre-built research environment for MARs docker_run experiments.
+# Contains common scientific Python packages so agents don't waste
+# time installing them on every run.
+#
+# Build:  docker build -t mars-research -f docker/Dockerfile.research .
+# Usage:  docker_run with image="mars-research"
+
+FROM python:3.11-slim
+
+# System deps for scientific computing
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Scientific Python stack — covers most research experiment needs
+RUN pip install --no-cache-dir \
+    numpy scipy sympy matplotlib pandas scikit-learn \
+    networkx seaborn tqdm einops
+
+# PyTorch CPU-only (separate index)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# JAX CPU-only
+RUN pip install --no-cache-dir "jax[cpu]"
+
+# HuggingFace
+RUN pip install --no-cache-dir transformers datasets
+
+WORKDIR /workspace

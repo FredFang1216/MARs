@@ -56,7 +56,8 @@
     "web:dev": "cd web && bunx vite",
     "web:build": "cd web && bunx vite build",
     "web:serve": "bun run src/entrypoints/web.ts",
-    "web:start": "bun run web:build && bun run web:serve"
+    "web:start": "bun run web:build && bun run web:serve",
+    "docker:build-research": "docker build -t mars-research -f docker/Dockerfile.research ."
   },
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.12.6",

@@ -45,6 +45,60 @@ export function applyResultBudget(
   }
 }
 
+// ── Aggregate Result Budget (per-round) ─────────────────
+
+/** Max total chars for all tool results in a single round (200KB, matches Claude Code). */
+const MAX_AGGREGATE_RESULT_CHARS = 200_000
+/** Preview size for results that get persisted to disk. */
+const PERSISTED_PREVIEW_CHARS = 2_000
+
+interface ToolResultEntry {
+  toolName: string
+  result: string
+}
+
+/**
+ * Apply aggregate budget across all tool results in a single round.
+ * If total exceeds MAX_AGGREGATE_RESULT_CHARS, the largest results are
+ * persisted to disk and replaced with a short preview + file pointer.
+ *
+ * Inspired by Claude Code's MAX_TOOL_RESULTS_PER_MESSAGE_CHARS.
+ */
+export function applyAggregateResultBudget(
+  entries: ToolResultEntry[],
+  workingDir: string,
+): string[] {
+  const totalChars = entries.reduce((sum, e) => sum + e.result.length, 0)
+  if (totalChars <= MAX_AGGREGATE_RESULT_CHARS) {
+    return entries.map(e => e.result)
+  }
+
+  // Sort indices by result size descending — persist largest first
+  const indexed = entries.map((e, i) => ({ i, size: e.result.length }))
+  indexed.sort((a, b) => b.size - a.size)
+
+  const output = entries.map(e => e.result)
+  let currentTotal = totalChars
+
+  const outDir = join(workingDir, '.claude-paper', 'tool-output')
+  mkdirSync(outDir, { recursive: true })
+
+  for (const { i, size } of indexed) {
+    if (currentTotal <= MAX_AGGREGATE_RESULT_CHARS) break
+    // Persist this result to disk
+    const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.txt`
+    const fullPath = join(outDir, fileName)
+    writeFileSync(fullPath, entries[i].result, 'utf-8')
+    const relPath = relative(workingDir, fullPath)
+
+    const preview = entries[i].result.slice(0, PERSISTED_PREVIEW_CHARS)
+    output[i] = `${preview}\n\n... [aggregate budget — full output (${size} chars) saved to: ${relPath}]\nUse read_file to see the complete output.`
+    currentTotal -= size - output[i].length
+  }
+
+  return output
+}
+
 // ── Single Tool Execution ────────────────────────────────
 
 export interface ExecuteToolCallOptions {

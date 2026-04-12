@@ -34,10 +34,96 @@ export type EvidenceStrengthType =
   | 'consistent_with'
   | 'no_support'
 
+// ── Evidence Ladder (inspired by DeepScientist) ─────────
+// Tiered acceptance criteria preventing weak evidence from supporting strong claims.
+
+export type EvidenceTier = 'minimum' | 'solid' | 'maximum'
+
+/**
+ * Requirements for each evidence tier.
+ *
+ * minimum  — executable, comparable setup, direction not obviously broken
+ * solid    — main comparison credible, baseline fair, results stable, significance tested
+ * maximum  — main claim already credible, additional analysis broadens confidence/scope
+ */
+export const EVIDENCE_TIER_THRESHOLDS: Record<EvidenceTier, {
+  minConfidence: number
+  requiredEvidenceTypes: EvidenceStrengthType[]
+  minEvidenceCount: number
+  description: string
+}> = {
+  minimum: {
+    minConfidence: 0.3,
+    requiredEvidenceTypes: ['heuristic_motivation', 'consistent_with', 'empirical_support', 'theorem_support', 'ablation_support'],
+    minEvidenceCount: 1,
+    description: 'Basic executable result, direction not obviously broken',
+  },
+  solid: {
+    minConfidence: 0.6,
+    requiredEvidenceTypes: ['empirical_support', 'theorem_support', 'ablation_support'],
+    minEvidenceCount: 2,
+    description: 'Main comparison credible, baseline fair, results stable',
+  },
+  maximum: {
+    minConfidence: 0.8,
+    requiredEvidenceTypes: ['empirical_support', 'theorem_support'],
+    minEvidenceCount: 3,
+    description: 'Main claim credible, analysis broadens confidence and scope',
+  },
+}
+
+/**
+ * Determine the highest evidence tier a claim currently meets.
+ */
+export function computeEvidenceTier(claim: Claim): EvidenceTier {
+  const { confidence, evidenceType } = claim.strength
+  const evidenceCount = claim.evidence.grounded.length + claim.evidence.derived.length
+
+  // Check from highest to lowest
+  for (const tier of ['maximum', 'solid', 'minimum'] as EvidenceTier[]) {
+    const req = EVIDENCE_TIER_THRESHOLDS[tier]
+    if (
+      confidence >= req.minConfidence &&
+      req.requiredEvidenceTypes.includes(evidenceType) &&
+      evidenceCount >= req.minEvidenceCount
+    ) {
+      return tier
+    }
+  }
+  return 'minimum'
+}
+
+/**
+ * Check whether a claim meets the required tier for admission.
+ * Theorem/novelty claims require 'solid'; others require 'minimum'.
+ */
+export function meetsAdmissionRequirement(claim: Claim): {
+  meets: boolean
+  currentTier: EvidenceTier
+  requiredTier: EvidenceTier
+  gap: string | null
+} {
+  const currentTier = computeEvidenceTier(claim)
+  const requiredTier: EvidenceTier =
+    claim.type === 'theorem' || claim.type === 'novelty' ? 'solid' : 'minimum'
+
+  const tierOrder: Record<EvidenceTier, number> = { minimum: 0, solid: 1, maximum: 2 }
+  const meets = tierOrder[currentTier] >= tierOrder[requiredTier]
+
+  return {
+    meets,
+    currentTier,
+    requiredTier,
+    gap: meets ? null : `Requires ${requiredTier} (${EVIDENCE_TIER_THRESHOLDS[requiredTier].description}), currently at ${currentTier}`,
+  }
+}
+
 export interface ClaimStrength {
   confidence: number // 0-1
   evidenceType: EvidenceStrengthType
   vulnerabilityScore: number // 0-1, higher = more vulnerable
+  /** Computed evidence tier — set automatically by claim graph operations. */
+  evidenceTier?: EvidenceTier
 }
 
 export interface AssessmentEntry {

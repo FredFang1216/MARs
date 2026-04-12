@@ -7,6 +7,8 @@ export default defineConfig({
   resolve: {
     alias: {
       '@shared': resolve(__dirname, '../src/shared'),
+      'react': resolve(__dirname, 'node_modules/react'),
+      'react-dom': resolve(__dirname, 'node_modules/react-dom'),
     },
   },
   server: {

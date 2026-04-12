@@ -14,7 +14,7 @@ export { buildTool, type ToolDef, type ToolCategory, type ToolResult, type ToolE
 export { ToolRegistry, registry } from './registry'
 
 // Execution pipeline
-export { executeToolCall, applyResultBudget } from './execution'
+export { executeToolCall, applyResultBudget, applyAggregateResultBudget } from './execution'
 
 // Concurrent orchestration
 export { runToolCalls } from './orchestration'

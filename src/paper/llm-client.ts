@@ -780,7 +780,9 @@ async function chatCompletionOpenAICompat(
     cost_usd: estimateCost(inputTokens, outputTokens, model),
     tool_calls,
     stop_reason:
-      choice?.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn',
+      choice?.finish_reason === 'tool_calls' ? 'tool_use'
+      : choice?.finish_reason === 'length' ? 'max_tokens'
+      : 'end_turn',
   }
 }
 
@@ -949,6 +951,8 @@ async function chatCompletionOpenAIResponses(
     output_tokens: outputTokens,
     cost_usd: estimateCost(inputTokens, outputTokens, model),
     tool_calls,
-    stop_reason: funcCalls.length > 0 ? 'tool_use' : 'end_turn',
+    stop_reason: funcCalls.length > 0 ? 'tool_use'
+      : wasTruncated ? 'max_tokens'
+      : 'end_turn',
   }
 }

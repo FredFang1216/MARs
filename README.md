@@ -286,6 +286,20 @@ npx vite
 # Open http://localhost:5173
 ```
 
+### Docker Research Environment (Recommended)
+
+If you want MARs to run experiments via `docker_run` (PyTorch, JAX, etc.), build the pre-packaged research image. This avoids re-installing dependencies on every experiment run.
+
+```bash
+# Prerequisites: Docker (https://docs.docker.com/get-docker/)
+bun run docker:build-research
+
+# Includes: numpy, scipy, sympy, matplotlib, pandas, scikit-learn,
+#           PyTorch (CPU), JAX (CPU), transformers, datasets, einops
+```
+
+Once built, MARs automatically uses `mars-research` instead of plain `python:3.11` when running experiments. No configuration needed.
+
 ## Quick Start
 
 ### CLI

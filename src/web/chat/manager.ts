@@ -57,7 +57,32 @@ import { addPaperToAcquired } from '../../paper/literature-db'
 const MAX_CONTEXT_MESSAGES = 40
 
 // Maximum number of tool call rounds per user message
-const MAX_TOOL_ROUNDS = 5
+const MAX_TOOL_ROUNDS = 15
+// Maximum truncation recovery retries
+const MAX_TRUNCATION_RETRIES = 3
+// Keep only the last N rounds of tool results in full context
+const KEEP_RECENT_TOOL_ROUNDS = 3
+const TOOL_RESULT_RE = /^\[Tool result for .+\]: /
+
+/**
+ * Microcompaction: replace old tool-result messages with a short marker.
+ * Keeps the most recent `keep` tool-result user messages intact.
+ */
+function microcompactMessages(messages: { role: string; content: string }[], keep: number): void {
+  const indices: number[] = []
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'user' && TOOL_RESULT_RE.test(messages[i].content)) {
+      indices.push(i)
+    }
+  }
+  const toClear = indices.slice(0, -keep || indices.length)
+  for (const idx of toClear) {
+    messages[idx] = {
+      role: 'user',
+      content: '[Tool result cleared to save context]',
+    }
+  }
+}
 
 export class ChatManager {
   private processing = false
@@ -140,18 +165,76 @@ export class ChatManager {
         modelSpec: this.getModelSpec(),
         system,
         messages,
-        max_tokens: 4096,
+        max_tokens: 16384,
         tools: tools.length > 0 ? tools : undefined,
         signal,
       })
 
-      // 3. Handle tool calls in a loop, accumulating context across rounds
+      // 3. Handle tool calls + truncation recovery in a loop
       let rounds = 0
+      let truncationRetries = 0
       let allToolSummaries: { name: string; summary: string }[] = []
       let runningMessages = [...messages]
 
-      while (result.tool_calls && result.tool_calls.length > 0 && rounds < MAX_TOOL_ROUNDS) {
+      while (rounds < MAX_TOOL_ROUNDS) {
         if (signal.aborted) break
+
+        // ── Truncation recovery ──────────────────────────
+        // If the model was cut off by max_tokens, inject a continuation
+        // prompt and retry (up to MAX_TRUNCATION_RETRIES times).
+        if (result.stop_reason === 'max_tokens' || result.stop_reason === 'length') {
+          if (truncationRetries < MAX_TRUNCATION_RETRIES) {
+            truncationRetries++
+            runningMessages = [
+              ...runningMessages,
+              { role: 'assistant' as const, content: result.text || '' },
+              { role: 'user' as const, content: 'Your response was truncated. Resume directly from where you left off — no recap. If you were about to call tools, call them now.' },
+            ]
+            result = await chatCompletion({
+              modelSpec: this.getModelSpec(),
+              system,
+              messages: runningMessages,
+              max_tokens: 16384,
+              tools: tools.length > 0 ? tools : undefined,
+              signal,
+            })
+            continue
+          }
+          break // exhausted truncation retries
+        }
+
+        // ── No tool calls — check for dangling intent ────
+        if (!result.tool_calls || result.tool_calls.length === 0) {
+          // Detect "dangling intent": model narrates what it wants to do
+          // next but stops without actually calling tools. Common patterns:
+          // ends with ":", "Let me...", "I'll now...", "checking...", etc.
+          const text = (result.text || '').trimEnd()
+          const danglingIntent = truncationRetries < MAX_TRUNCATION_RETRIES && text.length > 0 && (
+            /[:：]\s*$/.test(text) ||
+            /(?:let me|i'll|i will|now (?:let|check|look|search|read|fetch|download))\b[^.!?]*$/i.test(text)
+          )
+          if (danglingIntent) {
+            truncationRetries++
+            runningMessages = [
+              ...runningMessages,
+              { role: 'assistant' as const, content: text },
+              { role: 'user' as const, content: 'You stopped mid-thought. Continue — call the tools you were about to use.' },
+            ]
+            result = await chatCompletion({
+              modelSpec: this.getModelSpec(),
+              system,
+              messages: runningMessages,
+              max_tokens: 16384,
+              tools: tools.length > 0 ? tools : undefined,
+              signal,
+            })
+            continue
+          }
+          break
+        }
+
+        // Reset truncation counter on successful tool-use
+        truncationRetries = 0
         rounds++
 
         const toolResults: { id: string; content: string }[] = []
@@ -188,21 +271,45 @@ export class ChatManager {
 
         if (signal.aborted) break
 
+        // Apply aggregate budget — cap total tool result size per round
+        const rawEntries = toolResults.map(tr => ({
+          toolName: tr.id,
+          result: tr.content,
+        }))
+        const totalSize = rawEntries.reduce((s, e) => s + e.result.length, 0)
+        const MAX_AGGREGATE = 200_000
+        let budgetedResults = toolResults.map(tr => tr.content)
+        if (totalSize > MAX_AGGREGATE) {
+          // Sort by size descending, truncate largest first
+          const indexed = rawEntries.map((e, i) => ({ i, size: e.result.length }))
+          indexed.sort((a, b) => b.size - a.size)
+          budgetedResults = [...budgetedResults]
+          let remaining = totalSize
+          for (const { i, size } of indexed) {
+            if (remaining <= MAX_AGGREGATE) break
+            budgetedResults[i] = truncate(toolResults[i].content, 2000) + `\n\n... [truncated — full output was ${size} chars]`
+            remaining -= size - budgetedResults[i].length
+          }
+        }
+
         // Accumulate assistant response + tool results for next round
         runningMessages = [
           ...runningMessages,
           { role: 'assistant' as const, content: result.text || '' },
-          ...toolResults.map(tr => ({
+          ...budgetedResults.map((content, i) => ({
             role: 'user' as const,
-            content: `[Tool result for ${tr.id}]: ${tr.content}`,
+            content: `[Tool result for ${toolResults[i].id}]: ${content}`,
           })),
         ]
+
+        // Microcompact: clear old tool results before next LLM call
+        microcompactMessages(runningMessages, KEEP_RECENT_TOOL_ROUNDS)
 
         result = await chatCompletion({
           modelSpec: this.getModelSpec(),
           system,
           messages: runningMessages,
-          max_tokens: 4096,
+          max_tokens: 16384,
           tools: tools.length > 0 ? tools : undefined,
           signal,
         })
