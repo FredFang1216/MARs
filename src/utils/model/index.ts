@@ -67,6 +67,88 @@ export function getVertexRegionForModel(
   }
 }
 
+/**
+ * Bridge: if no CLI model profiles exist, synthesize them from the paper/web
+ * config (~/.claude-paper/config.json) so that Web UI settings work for CLI too.
+ */
+function synthesizeProfilesFromPaperConfig(): {
+  profiles: ModelProfile[]
+  pointers: { main: string; task: string; compact: string; quick: string }
+} | null {
+  try {
+    const { existsSync, readFileSync } = require('fs')
+    const { join } = require('path')
+    const { homedir } = require('os')
+    const paperConfigPath = join(homedir(), '.claude-paper', 'config.json')
+    if (!existsSync(paperConfigPath)) return null
+    const paperConfig = JSON.parse(readFileSync(paperConfigPath, 'utf-8'))
+    const models = paperConfig?.models
+    const apiKeys = paperConfig?.api_keys
+    if (!models || !apiKeys) return null
+
+    const seen = new Set<string>()
+    const profiles: ModelProfile[] = []
+
+    const inferProvider = (spec: string): string => {
+      if (spec.includes(':')) return spec.split(':')[0]
+      if (spec.startsWith('gpt') || spec.includes('o3') || spec.includes('o4')) return 'openai'
+      if (spec.startsWith('deepseek')) return 'deepseek'
+      if (spec.startsWith('qwen')) return 'qwen'
+      if (spec.startsWith('glm')) return 'glm'
+      return 'anthropic'
+    }
+
+    const extractModel = (spec: string): string => {
+      const idx = spec.indexOf(':')
+      return idx >= 0 ? spec.slice(idx + 1) : spec
+    }
+
+    const getApiKey = (provider: string): string => {
+      if (provider === 'anthropic') return apiKeys.anthropic || process.env.ANTHROPIC_API_KEY || ''
+      if (provider === 'openai') return apiKeys.openai || process.env.OPENAI_API_KEY || ''
+      return (apiKeys as any)[provider] || ''
+    }
+
+    for (const [, spec] of Object.entries(models) as [string, string][]) {
+      if (!spec || seen.has(spec)) continue
+      seen.add(spec)
+      const provider = inferProvider(spec)
+      const modelName = extractModel(spec)
+      const apiKey = getApiKey(provider)
+      if (!apiKey) continue
+      profiles.push({
+        name: spec,
+        provider: provider as any,
+        modelName,
+        apiKey: apiKey.slice(-20),
+        maxTokens: 16384,
+        contextLength: 200000,
+        isActive: true,
+        createdAt: Date.now(),
+      })
+    }
+
+    if (profiles.length === 0) return null
+
+    const mainSpec = models.research || profiles[0].name
+    const mainModel = extractModel(mainSpec)
+    const mainProfile = profiles.find(p => p.modelName === mainModel)
+    const mainName = mainProfile?.name || profiles[0].name
+
+    return {
+      profiles,
+      pointers: {
+        main: mainName,
+        task: mainName,
+        compact: mainName,
+        quick: mainName,
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
 export class ModelManager {
   private config: any
   private modelProfiles: ModelProfile[]
@@ -74,6 +156,15 @@ export class ModelManager {
   constructor(config: any) {
     this.config = config
     this.modelProfiles = config.modelProfiles || []
+
+    if (this.modelProfiles.length === 0 && !config.modelPointers?.main) {
+      const synthesized = synthesizeProfilesFromPaperConfig()
+      if (synthesized) {
+        this.modelProfiles = synthesized.profiles
+        this.config.modelProfiles = synthesized.profiles
+        this.config.modelPointers = synthesized.pointers
+      }
+    }
   }
 
   getCurrentModel(): string | null {
