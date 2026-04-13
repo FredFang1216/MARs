@@ -578,6 +578,28 @@ export async function handleApiRoute(req: Request, cwd: string): Promise<Respons
     }
   }
 
+  // ── Provider Status ──────────────────────────────
+
+  if (path === '/api/provider-status' && method === 'GET') {
+    const { hasCredentials, getAvailableProviders, resolveWithFallback } = await import('../../paper/llm-client')
+    const { DEFAULT_MODEL_ASSIGNMENTS } = await import('../../paper/types')
+    const providers: Record<string, { available: boolean; defaultFor: string[] }> = {}
+    const allProviders = ['anthropic', 'openai', 'deepseek', 'qwen', 'glm'] as const
+    for (const p of allProviders) {
+      const roles = Object.entries(DEFAULT_MODEL_ASSIGNMENTS)
+        .filter(([, spec]) => spec.startsWith(p + ':'))
+        .map(([role]) => role)
+      providers[p] = { available: hasCredentials(p), defaultFor: roles }
+    }
+    const chatFallback = resolveWithFallback(DEFAULT_MODEL_ASSIGNMENTS.research)
+    return json({
+      providers,
+      available: getAvailableProviders(),
+      chatModel: chatFallback.modelSpec,
+      usingFallback: chatFallback.fallback,
+    })
+  }
+
   // ── System Check ─────────────────────────────────
 
   if (path === '/api/system-check' && method === 'GET') {

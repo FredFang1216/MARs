@@ -464,6 +464,85 @@ export function getOpenAICompatibleClient(provider: string): OpenAI {
   return client
 }
 
+// ── Provider Credential Detection ──────────────────────
+
+/**
+ * Check whether credentials are available for a given provider
+ * without instantiating a client or throwing.
+ */
+export function hasCredentials(provider: PaperProvider): boolean {
+  const keys = loadApiKeyFromConfig()
+
+  switch (provider) {
+    case 'anthropic': {
+      if (process.env.ANTHROPIC_AUTH_TOKEN) return true
+      if (keys.anthropic_auth_token) return true
+      if (keys.anthropic) return true
+      if (process.env.ANTHROPIC_API_KEY) return true
+      return false
+    }
+    case 'openai': {
+      if (process.env.OPENAI_API_KEY) return true
+      if (keys.openai) return true
+      return false
+    }
+    default: {
+      const info = OPENAI_COMPAT_PROVIDERS[provider]
+      if (!info) return false
+      for (const envKey of info.envKeys) {
+        if (process.env[envKey]) return true
+      }
+      if ((keys as any)[provider]) return true
+      return false
+    }
+  }
+}
+
+/**
+ * Return a list of providers that have credentials configured,
+ * in preferred fallback order.
+ */
+export function getAvailableProviders(): PaperProvider[] {
+  const all: PaperProvider[] = ['anthropic', 'openai', 'deepseek', 'qwen', 'glm']
+  return all.filter(p => hasCredentials(p))
+}
+
+// ── Provider Fallback ──────────────────────────────────
+
+const FALLBACK_MODELS: Record<PaperProvider, string> = {
+  anthropic: 'claude-sonnet-4-20250514',
+  openai: 'gpt-4o',
+  deepseek: 'deepseek-chat',
+  qwen: 'qwen-plus',
+  glm: 'glm-4-plus',
+}
+
+/**
+ * If the requested provider has no credentials, find an alternative
+ * provider that does and return a remapped modelSpec.
+ * Returns { modelSpec, fallback: true } if remapped, or { modelSpec, fallback: false } if unchanged.
+ */
+export function resolveWithFallback(modelSpec: string): { modelSpec: string; fallback: boolean; originalProvider?: PaperProvider; resolvedProvider?: PaperProvider } {
+  const provider = getProviderFromSpec(modelSpec)
+  if (hasCredentials(provider)) {
+    return { modelSpec, fallback: false }
+  }
+
+  const available = getAvailableProviders()
+  if (available.length === 0) {
+    return { modelSpec, fallback: false }
+  }
+
+  const target = available[0]
+  const fallbackModel = FALLBACK_MODELS[target]
+  return {
+    modelSpec: `${target}:${fallbackModel}`,
+    fallback: true,
+    originalProvider: provider,
+    resolvedProvider: target,
+  }
+}
+
 // ── Provider Detection ──────────────────────────────────
 
 /**
@@ -532,6 +611,16 @@ export interface UnifiedChatResult {
 export async function chatCompletion(
   opts: UnifiedChatOptions,
 ): Promise<UnifiedChatResult> {
+  // Auto-fallback: if requested provider has no credentials, switch to one that does
+  const resolved = resolveWithFallback(opts.modelSpec)
+  if (resolved.fallback) {
+    const debugMsg = `[llm-client] ${resolved.originalProvider} credentials not found, falling back to ${resolved.resolvedProvider} (${resolved.modelSpec})`
+    if (process.env.DEBUG || process.env.VERBOSE) {
+      console.error(debugMsg)
+    }
+    opts = { ...opts, modelSpec: resolved.modelSpec }
+  }
+
   const provider = getProviderFromSpec(opts.modelSpec)
   const colonIdx = opts.modelSpec.indexOf(':')
   const modelId =

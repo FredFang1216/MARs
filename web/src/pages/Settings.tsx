@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react'
-import { fetchConfig, updateConfig, fetchSystemCheck, type SystemCapabilities } from '../api/client'
+import { fetchConfig, updateConfig, fetchSystemCheck, fetchProviderStatus, type SystemCapabilities, type ProviderStatus } from '../api/client'
 import { PROVIDERS, MODEL_ROLES, type AuthMethod } from '../constants/modelCatalog'
 
 // Per-credential state: each auth method has its own display/edit state
@@ -21,11 +21,15 @@ export default function Settings() {
   const [showCustom, setShowCustom] = useState<Record<string, boolean>>({})
   const [systemCaps, setSystemCaps] = useState<SystemCapabilities | null>(null)
   const [capsLoading, setCapsLoading] = useState(true)
+  const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null)
 
   useEffect(() => {
     fetchSystemCheck()
       .then(c => { setSystemCaps(c); setCapsLoading(false) })
       .catch(() => setCapsLoading(false))
+    fetchProviderStatus()
+      .then(setProviderStatus)
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -172,6 +176,18 @@ export default function Settings() {
           <div className="text-xs text-gray-600">System check unavailable.</div>
         )}
       </Section>
+
+      {/* Provider Status Banner */}
+      {providerStatus && providerStatus.available.length === 0 && (
+        <div className="bg-red-900/30 border border-red-800 rounded-lg p-3 mb-4 text-red-300 text-sm">
+          No LLM provider credentials configured. Chat and research features require at least one API key below.
+        </div>
+      )}
+      {providerStatus?.usingFallback && (
+        <div className="bg-yellow-900/30 border border-yellow-800 rounded-lg p-3 mb-4 text-yellow-300 text-sm">
+          Default provider (Anthropic) not configured. Chat will use <span className="font-mono font-medium">{providerStatus.chatModel}</span> as fallback.
+        </div>
+      )}
 
       {/* API Keys */}
       <Section title="API Keys" description="Configure credentials for each LLM provider. Only providers with credentials will appear in model selection.">

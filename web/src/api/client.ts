@@ -206,6 +206,19 @@ export function fetchSystemCheck(): Promise<SystemCapabilities> {
   return get('/api/system-check')
 }
 
+// ── Provider Status ─────────────────────────────────
+
+export interface ProviderStatus {
+  providers: Record<string, { available: boolean; defaultFor: string[] }>
+  available: string[]
+  chatModel: string
+  usingFallback: boolean
+}
+
+export function fetchProviderStatus(): Promise<ProviderStatus> {
+  return get('/api/provider-status')
+}
+
 // ── Unified Status ───────────────────────────────────
 
 export interface UnifiedStatus {

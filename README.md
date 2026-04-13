@@ -39,8 +39,9 @@ bun run dev          # launch CLI
 Real-time research dashboard with WebSocket streaming, interactive claim graph visualization, experiment monitoring, and literature management — all in the browser.
 
 ```bash
-bun run src/entrypoints/web.ts   # backend on :3456
-cd web && npx vite               # frontend on :5173
+bun run web:start    # build + serve on :3456
+# Or for remote servers:
+CPAPER_WEB_HOST=0.0.0.0 bun run web:start
 ```
 
 **Web UI features:**
@@ -252,39 +253,100 @@ All configurable via `/settings`, the Web UI settings page, or `~/.claude-paper/
 
 ## Installation
 
-```bash
-# Prerequisites: Bun (https://bun.sh), LaTeX distribution (optional for compilation)
+### Prerequisites
 
+- **[Bun](https://bun.sh)** (v1.1+) — runtime and package manager
+- **[Node.js](https://nodejs.org)** (v20+) — required by some dependencies
+- **LaTeX distribution** — optional, for paper compilation (e.g., TeX Live)
+
+### Step 1: Clone and install dependencies
+
+```bash
 git clone https://github.com/FredFang1216/MARs.git
 cd MARs
-bun install
+bun install          # root dependencies (backend + CLI)
+cd web && bun install && cd ..   # frontend dependencies (separate package)
+```
 
-# API keys
-export ANTHROPIC_API_KEY="your-key"
-export OPENAI_API_KEY="your-key"        # for reasoning/review models
-export S2_API_KEY="your-key"            # optional, for Semantic Scholar
+### Step 2: Configure API keys
 
-# Build and run CLI
+You need **at least one** LLM provider. The system auto-detects available providers and falls back gracefully — e.g., if only OpenAI is configured, chat will use GPT-4o instead of Claude.
+
+```bash
+# Option A: Environment variables
+export ANTHROPIC_API_KEY="sk-ant-..."     # Anthropic (default for most tasks)
+export OPENAI_API_KEY="sk-..."            # OpenAI (used for reasoning/review)
+export S2_API_KEY="your-key"              # Semantic Scholar (optional, improves lit search)
+
+# Option B: Config file (~/.claude-paper/config.json)
+# Or configure via Web UI Settings page after launching
+```
+
+<details>
+<summary>Supported providers</summary>
+
+| Provider | Env Variable | Default Roles |
+|----------|-------------|---------------|
+| Anthropic | `ANTHROPIC_API_KEY` | research, coding, writing, quick |
+| OpenAI | `OPENAI_API_KEY` | reasoning, review |
+| DeepSeek | `DEEPSEEK_API_KEY` | — |
+| Qwen | `DASHSCOPE_API_KEY` | — |
+| GLM | `ZHIPU_API_KEY` | — |
+
+</details>
+
+### Step 3: Run
+
+**CLI (development mode):**
+```bash
+bun run dev
+```
+
+**CLI (production build):**
+```bash
 bun run build
 ./cli.js
-
-# Or run directly in development mode
-bun run dev
 ```
 
 ### Web UI Setup
 
+**Local machine (development):**
 ```bash
-# Terminal 1: Backend server
-bun run src/entrypoints/web.ts
+# Terminal 1: Backend (API + WebSocket on :3456)
+bun run web:serve
 
-# Terminal 2: Frontend dev server
-cd web
-bun install
-npx vite
+# Terminal 2: Frontend dev server (hot-reload on :5173)
+bun run web:dev
 
 # Open http://localhost:5173
 ```
+
+**Local machine (production build):**
+```bash
+bun run web:start    # builds frontend + starts server on :3456
+# Open http://localhost:3456
+```
+
+**Remote server:**
+```bash
+# Build and start with 0.0.0.0 binding so it's accessible from outside
+CPAPER_WEB_HOST=0.0.0.0 bun run web:start
+
+# Access from your browser: http://<server-ip>:3456
+```
+
+Or use SSH tunnel if you don't want to expose the port:
+```bash
+# On your local machine:
+ssh -L 3456:localhost:3456 user@remote-server
+# Then open http://localhost:3456 locally
+```
+
+| Env Variable | Default | Description |
+|---|---|---|
+| `CPAPER_WEB_PORT` | `3456` | Server port |
+| `CPAPER_WEB_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for remote access) |
+| `CPAPER_WEB_CWD` | `$PWD` | Working directory for research sessions |
 
 ### Docker Research Environment (Recommended)
 
