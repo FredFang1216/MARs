@@ -264,8 +264,8 @@ All configurable via `/settings`, the Web UI settings page, or `~/.claude-paper/
 ```bash
 git clone https://github.com/FredFang1216/MARs.git
 cd MARs
-bun install          # root dependencies (backend + CLI)
-cd web && bun install && cd ..   # frontend dependencies (separate package)
+bun install              # root dependencies (backend + CLI)
+cd web && npm install && cd ..   # frontend dependencies (npm avoids native module issues with bun)
 ```
 
 ### Step 2: Configure API keys
