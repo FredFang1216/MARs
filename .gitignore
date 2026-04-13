@@ -6,6 +6,9 @@ node_modules/
 dist/
 coverage/
 
+# Platform-specific lockfiles (contain native binary resolutions)
+web/bun.lock
+
 .tmp/
 .tmp-*/
 .tmp-kode-config/
