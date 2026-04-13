@@ -18,6 +18,8 @@ import AcquiredPapersTab from './research/AcquiredPapersTab'
 import MarkdownArtifactTab from './research/MarkdownArtifactTab'
 import Card from './shared/Card'
 import ExperimentDashboard from './experiments/ExperimentDashboard'
+import ActionsCard from './research/ActionsCard'
+import IntelTab from './research/IntelTab'
 import * as ws from '../api/ws'
 import { regenerateLiteratureArtifacts } from '../api/client'
 
@@ -70,7 +72,7 @@ export default function ResearchPanel() {
   // Determine the active tab label for fullscreen header
   const getTabLabel = () => {
     if (researchState) {
-      return { pipeline: 'Pipeline', literature: 'Literature', claims: 'Claims', experiments: 'Experiments' }[activeTab] ?? activeTab
+      return { pipeline: 'Pipeline', literature: 'Literature', claims: 'Claims', experiments: 'Experiments', intel: 'Intel' }[activeTab] ?? activeTab
     }
     return { papers: 'Papers', survey: 'Survey', taxonomy: 'Taxonomy', gaps: 'Research Gaps' }[litTab] ?? litTab
   }
@@ -95,8 +97,17 @@ export default function ResearchPanel() {
           {currentSessionId && (
             <ExperimentCard sessionId={currentSessionId} />
           )}
+          {currentSessionId && (
+            <ActionsCard sessionId={currentSessionId} />
+          )}
         </>
       )
+    }
+
+    if (activeTab === 'intel') {
+      return currentSessionId ? (
+        <IntelTab sessionId={currentSessionId} />
+      ) : null
     }
 
     if (activeTab === 'literature') {
@@ -228,6 +239,7 @@ export default function ResearchPanel() {
                 <TabButton label="Literature" id="fs-tab-literature" panelId="fs-panel-literature" active={activeTab === 'literature'} onClick={() => setActiveTab('literature')} count={literatureCount} />
                 <TabButton label="Claims" id="fs-tab-claims" panelId="fs-panel-claims" active={activeTab === 'claims'} onClick={() => setActiveTab('claims')} count={researchState.claimGraph?.claims?.length} />
                 <TabButton label="Experiments" id="fs-tab-experiments" panelId="fs-panel-experiments" active={activeTab === 'experiments'} onClick={() => setActiveTab('experiments')} />
+                <TabButton label="Intel" id="fs-tab-intel" panelId="fs-panel-intel" active={activeTab === 'intel'} onClick={() => setActiveTab('intel')} />
               </div>
             ) : (
               <div role="tablist" className="flex px-6 pt-2 gap-1 flex-shrink-0 border-b border-gray-800">
@@ -317,6 +329,13 @@ export default function ResearchPanel() {
                 panelId="panel-experiments"
                 active={activeTab === 'experiments'}
                 onClick={() => setActiveTab('experiments')}
+              />
+              <TabButton
+                label="Intel"
+                id="tab-intel"
+                panelId="panel-intel"
+                active={activeTab === 'intel'}
+                onClick={() => setActiveTab('intel')}
               />
             </div>
 

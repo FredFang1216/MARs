@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react'
-import { fetchConfig, updateConfig } from '../api/client'
+import { fetchConfig, updateConfig, fetchSystemCheck, type SystemCapabilities } from '../api/client'
 import { PROVIDERS, MODEL_ROLES, type AuthMethod } from '../constants/modelCatalog'
 
 // Per-credential state: each auth method has its own display/edit state
@@ -19,6 +19,14 @@ export default function Settings() {
   const [authMethodSelections, setAuthMethodSelections] = useState<AuthMethodSelection>({})
   const [customInputs, setCustomInputs] = useState<Record<string, string>>({})
   const [showCustom, setShowCustom] = useState<Record<string, boolean>>({})
+  const [systemCaps, setSystemCaps] = useState<SystemCapabilities | null>(null)
+  const [capsLoading, setCapsLoading] = useState(true)
+
+  useEffect(() => {
+    fetchSystemCheck()
+      .then(c => { setSystemCaps(c); setCapsLoading(false) })
+      .catch(() => setCapsLoading(false))
+  }, [])
 
   useEffect(() => {
     fetchConfig()
@@ -146,6 +154,24 @@ export default function Settings() {
       {success && (
         <div className="bg-green-900/30 border border-green-800 rounded-lg p-3 mb-4 text-green-300 text-sm">Configuration saved successfully.</div>
       )}
+
+      {/* System Capabilities */}
+      <Section title="System Capabilities" description="Detected system capabilities for experiment execution and paper compilation.">
+        {capsLoading ? (
+          <div className="text-xs text-gray-500">Checking system...</div>
+        ) : systemCaps ? (
+          <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+            <CapItem name="GPU" available={systemCaps.gpu} detail={systemCaps.gpu_name} sub={systemCaps.vram_gb ? `${systemCaps.vram_gb} GB VRAM` : undefined} />
+            <CapItem name="Python" available={systemCaps.python} detail={systemCaps.python_version} />
+            <CapItem name="Conda" available={systemCaps.conda} />
+            <CapItem name="Docker" available={systemCaps.docker} />
+            <CapItem name="LaTeX" available={systemCaps.latex} />
+            <CapItem name="R" available={systemCaps.r} />
+          </div>
+        ) : (
+          <div className="text-xs text-gray-600">System check unavailable.</div>
+        )}
+      </Section>
 
       {/* API Keys */}
       <Section title="API Keys" description="Configure credentials for each LLM provider. Only providers with credentials will appear in model selection.">
@@ -391,6 +417,19 @@ function Section({ title, description, children }: { title: string; description?
       <h3 className="text-sm font-semibold text-gray-300 mb-1">{title}</h3>
       {description && <p className="text-xs text-gray-600 mb-4">{description}</p>}
       {children}
+    </div>
+  )
+}
+
+function CapItem({ name, available, detail, sub }: { name: string; available: boolean; detail?: string; sub?: string }) {
+  return (
+    <div className="flex items-start gap-2 bg-surface-2 rounded-lg px-3 py-2">
+      <div className={`w-2 h-2 rounded-full mt-1 flex-shrink-0 ${available ? 'bg-accent-green' : 'bg-gray-700'}`} />
+      <div>
+        <div className={`text-sm ${available ? 'text-white' : 'text-gray-500'}`}>{name}</div>
+        {detail && <div className="text-xs text-gray-500">{detail}</div>}
+        {sub && <div className="text-[10px] text-gray-600">{sub}</div>}
+      </div>
     </div>
   )
 }

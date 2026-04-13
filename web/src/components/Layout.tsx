@@ -6,6 +6,8 @@ import Sidebar from './Sidebar'
 import ResearchPanel from './ResearchPanel'
 import ClaimGraphView from './graph/ClaimGraphView'
 import InterventionModal from './intervention/InterventionModal'
+import ReviewResultModal from './research/ReviewResultModal'
+import PdfPreviewModal from './research/PdfPreviewModal'
 
 export default function Layout() {
   const init = useWsStore(s => s.init)
@@ -39,6 +41,8 @@ export default function Layout() {
 
       {/* Global modals */}
       <InterventionModal />
+      <ReviewResultModal />
+      <PdfPreviewModal />
     </div>
   )
 }

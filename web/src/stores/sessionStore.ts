@@ -5,7 +5,13 @@ import {
   fetchSessionConversationState,
   fetchSessionKnowledgePack,
   fetchLiteratureArtifacts,
+  fetchUnifiedStatus,
+  fetchMethodScoreboard,
+  fetchDecisions,
+  fetchResearchPlan,
+  fetchFragments,
   type SessionMeta,
+  type UnifiedStatus,
 } from '../api/client'
 import * as ws from '../api/ws'
 import { useUiStore } from './uiStore'
@@ -23,6 +29,13 @@ interface SessionStore {
   literatureArtifacts: any | null
   sessionMode: 'conversation' | 'researching'
   knowledgePack: KnowledgePackState
+  // Intel data
+  unifiedStatus: UnifiedStatus | null
+  methodScoreboard: any | null
+  decisions: any[] | null
+  researchPlan: any | null
+  fragments: any[] | null
+
   loading: boolean
   error: string | null
 
@@ -36,6 +49,8 @@ interface SessionStore {
   loadKnowledgePack: (packId: string) => Promise<void>
   unloadKnowledgePack: () => Promise<void>
   refreshKnowledgePack: () => Promise<void>
+  fetchIntelData: () => Promise<void>
+  fetchFragmentList: () => Promise<void>
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -45,6 +60,11 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   literatureArtifacts: null,
   sessionMode: 'conversation',
   knowledgePack: { loaded: false, packId: null, manifest: null },
+  unifiedStatus: null,
+  methodScoreboard: null,
+  decisions: null,
+  researchPlan: null,
+  fragments: null,
   loading: false,
   error: null,
 
@@ -164,6 +184,35 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       })
     } catch {
       set({ knowledgePack: { loaded: false, packId: null, manifest: null } })
+    }
+  },
+
+  fetchIntelData: async () => {
+    const id = get().currentSessionId
+    if (!id) return
+    // Fetch all intel data in parallel, errors silently ignored
+    const [status, scoreboard, decs, plan] = await Promise.allSettled([
+      fetchUnifiedStatus(id),
+      fetchMethodScoreboard(id),
+      fetchDecisions(id, 10),
+      fetchResearchPlan(id),
+    ])
+    set({
+      unifiedStatus: status.status === 'fulfilled' ? status.value : null,
+      methodScoreboard: scoreboard.status === 'fulfilled' ? scoreboard.value : null,
+      decisions: decs.status === 'fulfilled' ? decs.value : null,
+      researchPlan: plan.status === 'fulfilled' ? plan.value : null,
+    })
+  },
+
+  fetchFragmentList: async () => {
+    const id = get().currentSessionId
+    if (!id) return
+    try {
+      const frags = await fetchFragments(id)
+      set({ fragments: frags })
+    } catch {
+      set({ fragments: null })
     }
   },
 }))

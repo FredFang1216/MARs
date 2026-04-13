@@ -14,7 +14,7 @@ interface UiStore {
   interventionModalOpen: boolean
   interventionModalData: any | null
   selectedClaimId: string | null
-  researchPanelTab: 'pipeline' | 'literature' | 'claims' | 'experiments'
+  researchPanelTab: 'pipeline' | 'literature' | 'claims' | 'experiments' | 'intel'
   contentFullscreen: boolean
 
   toggleSidebar: () => void

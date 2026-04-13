@@ -1,8 +1,10 @@
+import { useState } from 'react'
 import Badge from '../shared/Badge'
 import MarkdownViewer from '../shared/MarkdownViewer'
 import MetricsTable from './MetricsTable'
 import FigureGallery from './FigureGallery'
 import Card from '../shared/Card'
+import { promoteExperiment } from '../../api/client'
 import type { ExperimentDetail } from './types'
 
 interface Props {
@@ -17,6 +19,21 @@ export default function ExperimentDetailView({ sessionId, detail, note, onBack }
   const status = log_entry.status
   const success = status === 'completed'
   const duration = log_entry.duration_seconds ?? meta?.duration_seconds
+  const [promoting, setPromoting] = useState(false)
+  const [promoteResult, setPromoteResult] = useState<string | null>(null)
+  const canPromote = log_entry.tier === 1 && status === 'completed' && !meta?.promoted_to_run
+
+  const handlePromote = async () => {
+    setPromoting(true)
+    try {
+      const result = await promoteExperiment(sessionId, log_entry.id)
+      setPromoteResult(result?.run_id ?? 'Promoted')
+    } catch (err: any) {
+      setPromoteResult(`Error: ${err.message}`)
+    } finally {
+      setPromoting(false)
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -36,6 +53,18 @@ export default function ExperimentDetailView({ sessionId, detail, note, onBack }
           {status}
         </Badge>
         <span className="text-[10px] font-mono text-gray-600">Tier {log_entry.tier}</span>
+        {canPromote && (
+          <button
+            onClick={handlePromote}
+            disabled={promoting}
+            className="ml-auto px-2.5 py-1 bg-accent-cyan/15 text-accent-cyan rounded text-xs font-medium hover:bg-accent-cyan/25 transition-colors disabled:opacity-50"
+          >
+            {promoting ? 'Promoting...' : 'Promote to Full Run'}
+          </button>
+        )}
+        {promoteResult && (
+          <span className="text-[10px] text-gray-500 ml-1">{promoteResult}</span>
+        )}
       </div>
 
       {/* Purpose / Hypothesis */}
