@@ -17,9 +17,27 @@ import { OrchestratorManager } from '../web/orchestrator/manager'
 import { CreationManager } from '../web/creation/manager'
 import { handleApiRoute } from '../web/api/routes'
 
-const PORT = Number(process.env.CPAPER_WEB_PORT) || 3456
+const REQUESTED_PORT = Number(process.env.CPAPER_WEB_PORT) || 3456
 const HOST = process.env.CPAPER_WEB_HOST || '127.0.0.1'
 const CWD = process.env.CPAPER_WEB_CWD || process.cwd()
+
+async function findAvailablePort(startPort: number, maxAttempts = 20): Promise<number> {
+  for (let port = startPort; port < startPort + maxAttempts; port++) {
+    try {
+      const server = Bun.serve({ hostname: HOST, port, fetch() { return new Response('') } })
+      server.stop(true)
+      return port
+    } catch {
+      // port in use, try next
+    }
+  }
+  throw new Error(`No available port found in range ${startPort}-${startPort + maxAttempts - 1}`)
+}
+
+const PORT = await findAvailablePort(REQUESTED_PORT)
+if (PORT !== REQUESTED_PORT) {
+  console.log(`Port ${REQUESTED_PORT} is in use, using ${PORT} instead.`)
+}
 
 // Single orchestrator manager shared across all connections
 const orchestratorManager = new OrchestratorManager()

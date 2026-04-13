@@ -344,9 +344,35 @@ ssh -L 3456:localhost:3456 user@remote-server
 
 | Env Variable | Default | Description |
 |---|---|---|
-| `CPAPER_WEB_PORT` | `3456` | Server port |
+| `CPAPER_WEB_PORT` | `3456` | Server port (auto-increments if taken) |
 | `CPAPER_WEB_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for remote access) |
 | `CPAPER_WEB_CWD` | `$PWD` | Working directory for research sessions |
+
+### Shared Server (Multi-User)
+
+On shared machines (e.g., university GPU clusters), each user can run their own instance safely:
+
+```bash
+# Each user runs from their own home directory — no conflicts
+cd ~/my-research
+CPAPER_WEB_HOST=0.0.0.0 bun run web:start
+```
+
+**What's isolated per user:**
+- **Config & API keys** — stored in `~/.claude-paper/config.json` (permissions `600`, directory `700`), inaccessible to other users
+- **Research sessions** — stored in `{CWD}/.claude-paper-research/`, each user works in their own directory
+- **Port** — if port 3456 is already taken by another user, the server automatically finds the next available port
+
+**Recommended:** Use `CPAPER_WEB_PORT` to assign each user a fixed port, or let the auto-increment handle it:
+```bash
+# User A
+CPAPER_WEB_PORT=3456 CPAPER_WEB_HOST=0.0.0.0 bun run web:start
+
+# User B
+CPAPER_WEB_PORT=3457 CPAPER_WEB_HOST=0.0.0.0 bun run web:start
+```
+
+**Security note:** Prefer storing API keys in `~/.claude-paper/config.json` (via Web UI Settings page) rather than environment variables. The config file is restricted to owner-only access (`chmod 600`). Environment variables can be read by other users with root access via `/proc`.
 
 ### Docker Research Environment (Recommended)
 

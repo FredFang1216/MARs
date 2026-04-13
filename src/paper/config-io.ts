@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { DEFAULT_MODEL_ASSIGNMENTS } from './types'
 
@@ -20,8 +20,17 @@ export function loadConfig(): Record<string, any> {
 }
 
 export function saveConfig(config: Record<string, any>): void {
-  mkdirSync(CONFIG_DIR, { recursive: true })
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', 'utf-8')
+  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 })
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', {
+    encoding: 'utf-8',
+    mode: 0o600,
+  })
+  try {
+    chmodSync(CONFIG_DIR, 0o700)
+    chmodSync(CONFIG_PATH, 0o600)
+  } catch {
+    // best-effort on systems where chmod may fail
+  }
 }
 
 export function getDefaultConfig(): Record<string, any> {
